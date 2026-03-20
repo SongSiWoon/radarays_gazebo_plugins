@@ -33,6 +33,8 @@
 #include <radarays_ros/msg/radar_params.hpp>
 #include <radarays_ros/radar_types.h>
 
+#include <radarays_gazebo_plugins/radar_point.h>
+
 namespace rm = rmagine;
 
 namespace gazebo
@@ -60,6 +62,9 @@ public:
 
     // simulation buffer
     cv::Mat m_polar_image;
+
+    // 3D radar points for PointCloud2 output
+    std::vector<radarays_gazebo_plugins::RadarPoint> m_radar_points;
 
 protected:
     virtual bool UpdateImpl(const bool _force) override;

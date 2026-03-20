@@ -287,6 +287,11 @@
           <increment>${0.01 * M_PI / 180.0}</increment>
           <samples>400</samples>
         </horizontal>
+        <vertical>
+          <min_angle>${-15.0 * M_PI / 180.0}</min_angle>
+          <increment>${1.0 * M_PI / 180.0}</increment>
+          <samples>31</samples>
+        </vertical>
       </scan>
 
       <range>
@@ -298,6 +303,7 @@
     <plugin name="radarays_ros" filename="libradarays_embree_ros_gzplugin.so">
         <frame>radar</frame>
         <topic>radar/image</topic>
+        <pointcloud_topic>radar/points</pointcloud_topic>
     </plugin>
   </sensor>
 </gazebo>

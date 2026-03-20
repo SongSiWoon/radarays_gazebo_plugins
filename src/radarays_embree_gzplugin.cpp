@@ -57,6 +57,37 @@ RadaRaysEmbree::~RadaRaysEmbree()
 
 void RadaRaysEmbree::loadParamsSDF()
 {
+    if (!this->sdf->HasElement("ray")) {
+        return;
+    }
+
+    sdf::ElementPtr rayElem = this->sdf->GetElement("ray");
+    if (rayElem->HasElement("scan")) {
+        sdf::ElementPtr scanElem = rayElem->GetElement("scan");
+        if (scanElem->HasElement("horizontal")) {
+            auto h = scanElem->GetElement("horizontal");
+            m_radar_model.theta.size = h->Get<int>("samples");
+            // theta.inc and theta.min define the full-circle radar sweep
+            // keep the default inc = -(2*PI)/size, don't use SDF increment
+            m_radar_model.theta.inc = -(2.0 * M_PI) / m_radar_model.theta.size;
+        }
+        if (scanElem->HasElement("vertical")) {
+            auto v = scanElem->GetElement("vertical");
+            m_radar_model.phi.min = v->Get<float>("min_angle");
+            m_radar_model.phi.inc = v->Get<float>("increment");
+            m_radar_model.phi.size = v->Get<int>("samples");
+            std::cout << "[RadaRaysEmbree] Loaded vertical scan: phi.min="
+                << m_radar_model.phi.min << " phi.inc=" << m_radar_model.phi.inc
+                << " phi.size=" << m_radar_model.phi.size << std::endl;
+        }
+    }
+    if (rayElem->HasElement("range")) {
+        auto r = rayElem->GetElement("range");
+        m_radar_model.range.min = r->Get<float>("min");
+        m_radar_model.range.max = r->Get<float>("max");
+    }
+
+    m_polar_image = cv::Mat_<unsigned char>(0, m_radar_model.theta.size);
 }
 
 void RadaRaysEmbree::loadParams()
@@ -115,21 +146,21 @@ void RadaRaysEmbree::loadParams()
 
 
     // material properties
-
-
+    
+    
     // TODO:
     // this is how it was in a static environment:
-    //
+    // 
     // m_params.materials = loadRadarMaterialsFromParameterServer(m_nh_p);
     // m_nh_p->getParam("object_materials", m_object_materials);
     // m_nh_p->getParam("material_id_air", m_material_id_air);
-    //
-    // But Gazebo environments are changing. Maybe we can fetch custom
-    // materials from Gazebo?
+    // 
+    // But Gazebo environments are changing. Maybe we can fetch custom 
+    // materials from Gazebo? 
     // - A first quick solution would be to pass a list of materials
     //   as before and does not allow to change the world (at own risk)
-    //
-    // Or maybe: For each object spawn something is added to
+    // 
+    // Or maybe: For each object spawn something is added to 
     //   dynamic reconfigure?
 
 
@@ -166,18 +197,18 @@ void RadaRaysEmbree::searchForMaterials()
             link_sdf = link_sdf->GetNextElement("link"))
         {
             std::string link_name = link_sdf->GetAttribute("name")->GetAsString();
-
-
+            
+        
             for(sdf::ElementPtr vis_sdf = link_sdf->GetElement("visual");
                 vis_sdf;
                 vis_sdf = vis_sdf->GetNextElement("visual"))
             {
                 std::string vis_name = vis_sdf->GetAttribute("name")->GetAsString();
-
+                
                 sdf::ElementPtr mat_sdf = vis_sdf->GetElement("radarays_material");
 
                 radarays_ros::msg::RadarMaterial material;
-
+                
                 if(mat_sdf)
                 {
                     std::cout << "Found RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
@@ -193,7 +224,7 @@ void RadaRaysEmbree::searchForMaterials()
                     material.diffuse  = 0.0;
                     material.specular = 3000.0;
                 }
-
+                    
 
                 // figure out id in map
 
@@ -247,12 +278,12 @@ void RadaRaysEmbree::searchForMaterials()
                 }
             }
         }
-
+        
         // TODO:
         // full_name = model/link/...
         // put full name to embree map elements and compare instead
         // thus, we can apply materials to model parts
-
+        
     }
 
 }
@@ -368,7 +399,7 @@ void RadaRaysEmbree::Load(const std::string& world_name)
 
 void RadaRaysEmbree::simulate(rm::Transform Tsm)
 {
-    //
+    // 
     if(m_polar_image.rows != m_cfg.n_cells)
     {
         // m_polar_image = cv::Mat_<unsigned char>(n_cells, radar_model.theta.size);
@@ -394,7 +425,7 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
                 m_cfg.signal_denoising_triangular_width,
                 denoising_mode
             );
-
+            
         } else if(m_cfg.signal_denoising == 2) {
             // std::cout << "Gaussian";
             denoising_mode = m_cfg.signal_denoising_gaussian_mode * m_cfg.signal_denoising_gaussian_width;
@@ -424,7 +455,7 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
                 denoising_weights[i] /= denoising_mode_val;
             }
         }
-
+        
     }
 
 
@@ -472,6 +503,15 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
     rm::StopWatch sw_radar_sim;
     sw_radar_sim();
 
+    int n_phi = m_radar_model.phi.size;
+
+    // Thread-local storage for radar points
+    std::vector<std::vector<radarays_gazebo_plugins::RadarPoint>> thread_radar_points;
+    {
+        int max_threads = omp_get_max_threads();
+        thread_radar_points.resize(max_threads);
+    }
+
     #pragma omp parallel for
     for(size_t angle_id = 0; angle_id < n_angles; angle_id++)
     {
@@ -499,170 +539,210 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             std::cout << "ERROR!! Sim shared ptr empty" << std::endl;
         }
 
-        std::vector<DirectedWave> waves = m_waves_start;
+        // Collect all signals across phi for polar image (max-merge)
+        std::vector<Signal> signals_merged;
 
-        rm::OnDnModel model = make_model(waves);
-        sim->setModel(model);
-
-        rm::Transform Tas;
-        Tas.R = rm::EulerAngles{0.0, 0.0, m_radar_model.getTheta(angle_id)};
-        Tas.t = m_radar_model.getOrigin(0, angle_id);
-
-        rm::Transform Tam = Tsm * Tas;
-
-        rm::Memory<rm::Transform> Tams(1);
-        Tams[0] = Tam;
-
-        std::vector<Signal> signals;
-        ///////
-        /// 1. Signal generation
-        for(size_t pass_id = 0; pass_id < m_params.model.n_reflections; pass_id++)
+        for(size_t phi_id = 0; phi_id < n_phi; phi_id++)
         {
-            using ResT = rm::Bundle<
-                rm::Hits<rm::RAM>,
-                rm::Ranges<rm::RAM>,
-                rm::Normals<rm::RAM>,
-                rm::ObjectIds<rm::RAM>
-            >;
+            float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
 
-            ResT results;
+            std::vector<DirectedWave> waves = m_waves_start;
 
-            results.hits.resize(model.size());
-            results.ranges.resize(model.size());
-            results.normals.resize(model.size());
-            results.object_ids.resize(model.size());
+            rm::OnDnModel model = make_model(waves);
+            sim->setModel(model);
 
-            sim->simulate(Tams, results);
+            rm::Transform Tas;
+            Tas.R = rm::EulerAngles{0.0, phi_angle, m_radar_model.getTheta(angle_id)};
+            Tas.t = m_radar_model.getOrigin(0, angle_id);
 
-            std::vector<DirectedWave> waves_new;
+            rm::Transform Tam = Tsm * Tas;
 
-            for(size_t i=0; i < waves.size(); i++)
+            rm::Memory<rm::Transform> Tams(1);
+            Tams[0] = Tam;
+
+            std::vector<Signal> signals;
+            ///////
+            /// 1. Signal generation
+            for(size_t pass_id = 0; pass_id < m_params.model.n_reflections; pass_id++)
             {
-                DirectedWave wave = waves[i];
-                const float wave_range = results.ranges[i];
-                const rmagine::Vector surface_normal = results.normals[i].normalize();
-                const unsigned int obj_id = results.object_ids[i];
+                using ResT = rm::Bundle<
+                    rm::Hits<rm::RAM>,
+                    rm::Ranges<rm::RAM>,
+                    rm::Normals<rm::RAM>,
+                    rm::ObjectIds<rm::RAM>
+                >;
 
-                if(obj_id > 10000)
+                ResT results;
+
+                results.hits.resize(model.size());
+                results.ranges.resize(model.size());
+                results.normals.resize(model.size());
+                results.object_ids.resize(model.size());
+
+                sim->simulate(Tams, results);
+
+                std::vector<DirectedWave> waves_new;
+
+                for(size_t i=0; i < waves.size(); i++)
                 {
-                    continue;
-                }
+                    DirectedWave wave = waves[i];
+                    const float wave_range = results.ranges[i];
+                    const rmagine::Vector surface_normal = results.normals[i].normalize();
+                    const unsigned int obj_id = results.object_ids[i];
 
-                const DirectedWave incidence = wave.move(wave_range);
-
-                DirectedWave reflection = incidence;
-                DirectedWave refraction = incidence;
-
-                if(incidence.material_id == m_material_id_air)
-                {
-                    refraction.material_id = m_object_materials[obj_id];
-                } else {
-                    refraction.material_id = m_material_id_air;
-                }
-
-                float v_refraction = 1.0;
-
-                if(incidence.material_id != refraction.material_id)
-                {
-                    v_refraction = m_params.materials.data[refraction.material_id].velocity;
-                } else {
-                    v_refraction = incidence.velocity;
-                }
-
-                auto res = fresnel(surface_normal, incidence, v_refraction);
-
-                reflection.ray.dir = res.first.ray.dir;
-                reflection.energy = res.first.energy;
-
-                if(reflection.energy > m_wave_energy_threshold)
-                {
-                    waves_new.push_back(reflection);
-
-                    if(reflection.material_id == m_material_id_air)
+                    if(obj_id > 10000)
                     {
-                        auto material = m_params.materials.data[refraction.material_id];
+                        continue;
+                    }
 
-                        double incidence_angle = get_incidence_angle(surface_normal, incidence);
-                        double return_energy_path = back_reflection_shader(
-                            incidence_angle,
-                            reflection.energy,
-                            material.ambient,
-                            material.diffuse,
-                            material.specular
-                        );
+                    const DirectedWave incidence = wave.move(wave_range);
 
-                        if(pass_id == 0 || m_cfg.record_multi_reflection)
+                    DirectedWave reflection = incidence;
+                    DirectedWave refraction = incidence;
+
+                    if(incidence.material_id == m_material_id_air)
+                    {
+                        refraction.material_id = m_object_materials[obj_id];
+                    } else {
+                        refraction.material_id = m_material_id_air;
+                    }
+
+                    float v_refraction = 1.0;
+
+                    if(incidence.material_id != refraction.material_id)
+                    {
+                        v_refraction = m_params.materials.data[refraction.material_id].velocity;
+                    } else {
+                        v_refraction = incidence.velocity;
+                    }
+
+                    auto res = fresnel(surface_normal, incidence, v_refraction);
+
+                    reflection.ray.dir = res.first.ray.dir;
+                    reflection.energy = res.first.energy;
+
+                    if(reflection.energy > m_wave_energy_threshold)
+                    {
+                        waves_new.push_back(reflection);
+
+                        if(reflection.material_id == m_material_id_air)
                         {
-                            float time_back = incidence.time * 2.0;
-                            signals.push_back({time_back, return_energy_path});
-                        }
+                            auto material = m_params.materials.data[refraction.material_id];
 
-                        if(pass_id > 0 && m_cfg.record_multi_path)
-                        {
-                            Signal signal_air;
+                            double incidence_angle = get_incidence_angle(surface_normal, incidence);
+                            double return_energy_path = back_reflection_shader(
+                                incidence_angle,
+                                reflection.energy,
+                                material.ambient,
+                                material.diffuse,
+                                material.specular
+                            );
 
-                            rm::Vector dir_sensor_to_hit = reflection.ray.orig;
-                            const double distance_between_sensor_and_hit = dir_sensor_to_hit.l2norm();
-                            dir_sensor_to_hit.normalizeInplace();
-                            const double time_to_sensor = distance_between_sensor_and_hit / reflection.velocity;
-
-                            double sensor_view_scalar = wave.ray.dir.dot(dir_sensor_to_hit);
-
-                            double angle_between_reflection_and_sensor_dir
-                                = angle_between(-reflection.ray.dir, dir_sensor_to_hit);
-
-                            if(m_cfg.record_multi_path
-                                && sensor_view_scalar > m_cfg.multipath_threshold)
+                            if(pass_id == 0 || m_cfg.record_multi_reflection)
                             {
-                                double return_energy_air = back_reflection_shader(
-                                    angle_between_reflection_and_sensor_dir,
-                                    reflection.energy,
-                                    material.ambient,
-                                    material.diffuse,
-                                    material.specular
-                                );
+                                float time_back = incidence.time * 2.0;
+                                signals.push_back({time_back, return_energy_path});
+                            }
 
-                                signal_air.time = incidence.time + time_to_sensor;
-                                signal_air.strength = return_energy_air;
+                            if(pass_id > 0 && m_cfg.record_multi_path)
+                            {
+                                Signal signal_air;
 
-                                signals.push_back(signal_air);
+                                rm::Vector dir_sensor_to_hit = reflection.ray.orig;
+                                const double distance_between_sensor_and_hit = dir_sensor_to_hit.l2norm();
+                                dir_sensor_to_hit.normalizeInplace();
+                                const double time_to_sensor = distance_between_sensor_and_hit / reflection.velocity;
+
+                                double sensor_view_scalar = wave.ray.dir.dot(dir_sensor_to_hit);
+
+                                double angle_between_reflection_and_sensor_dir
+                                    = angle_between(-reflection.ray.dir, dir_sensor_to_hit);
+
+                                if(m_cfg.record_multi_path
+                                    && sensor_view_scalar > m_cfg.multipath_threshold)
+                                {
+                                    double return_energy_air = back_reflection_shader(
+                                        angle_between_reflection_and_sensor_dir,
+                                        reflection.energy,
+                                        material.ambient,
+                                        material.diffuse,
+                                        material.specular
+                                    );
+
+                                    signal_air.time = incidence.time + time_to_sensor;
+                                    signal_air.strength = return_energy_air;
+
+                                    signals.push_back(signal_air);
+                                }
                             }
                         }
                     }
+
+                    refraction.ray.dir = res.second.ray.dir;
+                    refraction.energy = res.second.energy;
+
+                    if(refraction.energy > m_wave_energy_threshold)
+                    {
+                        waves_new.push_back(refraction);
+                    }
                 }
 
-                refraction.ray.dir = res.second.ray.dir;
-                refraction.energy = res.second.energy;
-
-                if(refraction.energy > m_wave_energy_threshold)
+                float skip_dist = 0.001;
+                for(size_t i=0; i<waves_new.size(); i++)
                 {
-                    waves_new.push_back(refraction);
+                    waves_new[i].moveInplace(skip_dist);
+                }
+
+                waves = waves_new;
+
+                if(pass_id < m_params.model.n_reflections - 1)
+                {
+                    model = make_model(waves);
+                    sim->setModel(model);
                 }
             }
 
-            float skip_dist = 0.001;
-            for(size_t i=0; i<waves_new.size(); i++)
+            // Generate 3D radar points from signals for this (theta, phi) combination
+            float theta = m_radar_model.getTheta(angle_id);
+            for(size_t i=0; i<signals.size(); i++)
             {
-                waves_new[i].moveInplace(skip_dist);
+                auto signal = signals[i];
+                float half_time = signal.time / 2.0;
+                float signal_dist = 0.3 * half_time;
+
+                if(signal_dist >= m_radar_model.range.min && signal_dist <= m_radar_model.range.max
+                   && signal.strength > m_wave_energy_threshold)
+                {
+                    float cos_phi = cos(phi_angle);
+                    float sin_phi = sin(phi_angle);
+                    float cos_theta = cos(theta);
+                    float sin_theta = sin(theta);
+
+                    radarays_gazebo_plugins::RadarPoint pt;
+                    pt.x = signal_dist * cos_phi * cos_theta;
+                    pt.y = signal_dist * cos_phi * sin_theta;
+                    pt.z = -signal_dist * sin_phi;
+                    pt.intensity = static_cast<float>(signal.strength);
+                    thread_radar_points[tid].push_back(pt);
+                }
             }
 
-            waves = waves_new;
-
-            if(pass_id < m_params.model.n_reflections - 1)
+            // Merge signals into polar image signals (max-merge across all phi)
+            for(auto& sig : signals)
             {
-                model = make_model(waves);
-                sim->setModel(model);
+                signals_merged.push_back(sig);
             }
-        }
+
+        } // end phi loop
 
         //////////////////
-        /// 2. Signals -> Canvas
+        /// 2. Signals -> Canvas (max-merge all phi signals for this theta)
         cv::Mat_<float> slice(m_polar_image.rows, 1, 0.0);
 
         float max_val = 0.0;
-        for(size_t i=0; i<signals.size(); i++)
+        for(size_t i=0; i<signals_merged.size(); i++)
         {
-            auto signal = signals[i];
+            auto signal = signals_merged[i];
             float half_time = signal.time / 2.0;
             float signal_dist = 0.3 * half_time;
 
@@ -762,6 +842,13 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
         slice.convertTo(m_polar_image.col(col), CV_8UC1);
     }
 
+    // Merge thread-local radar points
+    m_radar_points.clear();
+    for(auto& pts : thread_radar_points)
+    {
+        m_radar_points.insert(m_radar_points.end(), pts.begin(), pts.end());
+    }
+
     double el_radar_sim = sw_radar_sim();
 
     // std::cout << "SIM in " << el_radar_sim << "s" << std::endl;
@@ -820,13 +907,13 @@ void RadaRaysEmbree::updateDynCfg(
     uint32_t level)
 {
     RCLCPP_INFO(m_nh_p->get_logger(), "RadaRaysEmbree - Changing Model");
-
+    
     // z_offset
     // auto T = rm::Transform::Identity();
     // T.t.z = config.z_offset;
     // sim->setTsb(T);
 
-    if(   config.beam_sample_dist != m_cfg.beam_sample_dist
+    if(   config.beam_sample_dist != m_cfg.beam_sample_dist 
         || abs(config.beam_width - m_cfg.beam_width ) > 0.001
         || config.n_samples != m_cfg.n_samples
         || abs(config.beam_sample_dist_normal_p_in_cone - m_cfg.beam_sample_dist_normal_p_in_cone) > 0.001

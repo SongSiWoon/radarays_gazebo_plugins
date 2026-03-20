@@ -13,6 +13,8 @@
 #include <rmagine/types/sensor_models.h>
 
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <image_transport/image_transport.hpp>
 
 #include <memory>
@@ -47,9 +49,14 @@ private:
     gazebo_ros::Node::SharedPtr m_nh;
 
     image_transport::Publisher m_pub_img;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_pub_pc;
 
     std::string m_frame_id;
     std::string m_topic;
+    std::string m_pc_topic;
+
+    float m_pc_fov_min = -M_PI;
+    float m_pc_fov_max = M_PI;
 
     sdf::ElementPtr m_sdf;
 };
