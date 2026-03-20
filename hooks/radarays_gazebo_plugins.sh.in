@@ -1,0 +1,2 @@
+ament_prepend_unique_value GAZEBO_PLUGIN_PATH "$AMENT_CURRENT_PREFIX/lib/@PROJECT_NAME@"
+ament_prepend_unique_value LD_LIBRARY_PATH "$AMENT_CURRENT_PREFIX/lib/@PROJECT_NAME@"

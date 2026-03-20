@@ -3,7 +3,6 @@
 #include <gazebo/sensors/SensorFactory.hh>
 
 #include <iostream>
-#include <boost/algorithm/string/replace.hpp>
 
 #include <rmagine/noise/GaussianNoise.hpp>
 #include <rmagine/noise/UniformDustNoise.hpp>
@@ -12,8 +11,6 @@
 #include <gazebo/common/Console.hh>
 
 #include <radarays_ros/RadarGPU.hpp>
-
-#include <boost/bind.hpp>
 
 #include <radarays_ros/ros_helper.h>
 
@@ -68,7 +65,6 @@ RadaRaysOptix::~RadaRaysOptix()
 
 void RadaRaysOptix::loadParamsSDF()
 {
-    // sdf::ElementPtr rayElem = this->sdf->GetElement("ray");
 }
 
 void RadaRaysOptix::loadParams()
@@ -89,13 +85,13 @@ void RadaRaysOptix::loadParams()
     // 2 default materials: air, wall stone
     m_params.materials.data.resize(2);
     {
-        radarays_ros::RadarMaterial material_air;
+        radarays_ros::msg::RadarMaterial material_air;
         material_air.velocity = 0.3; // m/ns
         material_air.ambient  = 1.0;
         material_air.diffuse  = 0.0;
         material_air.specular = 1.0;
         m_params.materials.data[0] = material_air;
-        radarays_ros::RadarMaterial material_wall_stone;
+        radarays_ros::msg::RadarMaterial material_wall_stone;
         material_wall_stone.velocity = 0.0;
         material_wall_stone.ambient  = 1.0;
         material_wall_stone.diffuse  = 0.0;
@@ -115,24 +111,24 @@ void RadaRaysOptix::loadParams()
 
     // find real materials
     m_polar_image = cv::Mat_<unsigned char>(0, m_radar_model.theta.size);
-    
+
     // TODO: load radar params from URDF
     // currently only via rqt_reconfigure
     loadParamsSDF();
-    
+
     // TODO:
     // this is how it was in a static environment:
-    // 
+    //
     // m_params.materials = loadRadarMaterialsFromParameterServer(m_nh_p);
     // m_nh_p->getParam("object_materials", m_object_materials);
     // m_nh_p->getParam("material_id_air", m_material_id_air);
-    // 
-    // But Gazebo environments are changing. Maybe we can fetch custom 
-    // materials from Gazebo? 
+    //
+    // But Gazebo environments are changing. Maybe we can fetch custom
+    // materials from Gazebo?
     // - A first quick solution would be to pass a list of materials
     //   as before and does not allow to change the world (at own risk)
-    // 
-    // Or maybe: For each object spawn something is added to 
+    //
+    // Or maybe: For each object spawn something is added to
     //   dynamic reconfigure?
 
     // TODO: load additional params from gazebo - xml (instead of ros paremeters)
@@ -166,7 +162,7 @@ void RadaRaysOptix::searchForMaterials()
 
     m_object_materials.resize(0);
     m_params.materials.data.resize(1);
-    radarays_ros::RadarMaterial material_air;
+    radarays_ros::msg::RadarMaterial material_air;
     material_air.velocity = 0.3; // m/ns
     material_air.ambient  = 1.0;
     material_air.diffuse  = 0.0;
@@ -187,17 +183,17 @@ void RadaRaysOptix::searchForMaterials()
             link_sdf = link_sdf->GetNextElement("link"))
         {
             std::string link_name = link_sdf->GetAttribute("name")->GetAsString();
-            
+
             for(sdf::ElementPtr vis_sdf = link_sdf->GetElement("visual");
                 vis_sdf;
                 vis_sdf = vis_sdf->GetNextElement("visual"))
             {
                 std::string vis_name = vis_sdf->GetAttribute("name")->GetAsString();
-                
+
                 sdf::ElementPtr mat_sdf = vis_sdf->GetElement("radarays_material");
 
-                radarays_ros::RadarMaterial material;
-                
+                radarays_ros::msg::RadarMaterial material;
+
                 if(mat_sdf)
                 {
                     std::cout << "Found RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
@@ -214,7 +210,7 @@ void RadaRaysOptix::searchForMaterials()
                     material.diffuse  = 0.0;
                     material.specular = 3000.0;
                 }
-                    
+
                 // figure out id in map
                 std::string name = model_name + "::" + link_name + "::" + vis_name;
 
@@ -247,7 +243,7 @@ void RadaRaysOptix::searchForMaterials()
                 {
                     m_map_mutex->unlock_shared();
                 }
-                
+
                 if(obj_id >= 0)
                 {
                     std::cout << "FOUND MODEL: " << name << std::endl;
@@ -268,7 +264,7 @@ void RadaRaysOptix::searchForMaterials()
                 }
             }
         }
-        
+
         // TODO:
         // full_name = model/link/...
         // put full name to optix map elements and compare instead
@@ -283,23 +279,103 @@ void RadaRaysOptix::Init()
 {
     Base::Init();
 
-    ros::NodeHandle gazebo_nh("~");
-    m_nh_p = std::make_shared<ros::NodeHandle>(gazebo_nh, "radarays");
+    m_nh_p = gazebo_ros::Node::Get(this->sdf);
 
     loadParams();
 
-    m_dyn_rec_server = std::make_shared<dynamic_reconfigure::Server<radarays_ros::RadarModelConfig> >(
-        *m_nh_p
-    );
+    // Declare ROS2 parameters (radar model config)
+    m_nh_p->declare_parameter("n_cells", 200);
+    m_nh_p->declare_parameter("resolution", 0.1);
+    m_nh_p->declare_parameter("scroll_image", 0);
+    m_nh_p->declare_parameter("range_min", 0.2);
+    m_nh_p->declare_parameter("range_max", 100.0);
+    m_nh_p->declare_parameter("beam_width", 3.0);
+    m_nh_p->declare_parameter("n_samples", 10);
+    m_nh_p->declare_parameter("n_reflections", 1);
+    m_nh_p->declare_parameter("beam_sample_dist", 0);
+    m_nh_p->declare_parameter("beam_sample_dist_normal_p_in_cone", 1.0);
+    m_nh_p->declare_parameter("signal_denoising", 0);
+    m_nh_p->declare_parameter("signal_denoising_triangular_width", 3);
+    m_nh_p->declare_parameter("signal_denoising_triangular_mode", 0);
+    m_nh_p->declare_parameter("signal_denoising_gaussian_width", 3);
+    m_nh_p->declare_parameter("signal_denoising_gaussian_mode", 0);
+    m_nh_p->declare_parameter("signal_denoising_mb_width", 3);
+    m_nh_p->declare_parameter("signal_denoising_mb_mode", 0);
+    m_nh_p->declare_parameter("signal_max", 120.0);
+    m_nh_p->declare_parameter("ambient_noise", 0);
+    m_nh_p->declare_parameter("ambient_noise_energy_max", 0.1);
+    m_nh_p->declare_parameter("ambient_noise_energy_min", 0.0);
+    m_nh_p->declare_parameter("ambient_noise_energy_loss", 0.1);
+    m_nh_p->declare_parameter("ambient_noise_at_signal_0", 0.5);
+    m_nh_p->declare_parameter("ambient_noise_at_signal_1", 0.0);
+    m_nh_p->declare_parameter("ambient_noise_perlin_scale_low", 0.01);
+    m_nh_p->declare_parameter("ambient_noise_perlin_scale_high", 0.1);
+    m_nh_p->declare_parameter("ambient_noise_perlin_p_low", 0.5);
+    m_nh_p->declare_parameter("record_multi_reflection", false);
+    m_nh_p->declare_parameter("record_multi_path", false);
+    m_nh_p->declare_parameter("multipath_threshold", 0.9);
+    m_nh_p->declare_parameter("include_motion", false);
 
-    dynamic_reconfigure::Server<radarays_ros::RadarModelConfig>::CallbackType f;
-    f = boost::bind(&RadaRaysOptix::updateDynCfg, this, boost::placeholders::_1, boost::placeholders::_2);
-    m_dyn_rec_server->setCallback(f);
+    // Apply initial config from parameters
+    radarays_ros::RadarModelConfig initial_cfg;
+    updateDynCfg(initial_cfg, 0);
+
+    // Register parameter change callback
+    m_param_callback = m_nh_p->add_on_set_parameters_callback(
+        std::bind(&RadaRaysOptix::onParameterChange, this, std::placeholders::_1));
 
     if(!m_map)
     {
         m_waiting_for_map = true;
     }
+}
+
+rcl_interfaces::msg::SetParametersResult RadaRaysOptix::onParameterChange(
+    const std::vector<rclcpp::Parameter>& params)
+{
+    radarays_ros::RadarModelConfig cfg = m_cfg;
+
+    for(const auto& param : params)
+    {
+        const std::string& name = param.get_name();
+        if(name == "n_cells")                              cfg.n_cells = param.as_int();
+        else if(name == "resolution")                     cfg.resolution = param.as_double();
+        else if(name == "scroll_image")                   cfg.scroll_image = param.as_int();
+        else if(name == "range_min")                      cfg.range_min = param.as_double();
+        else if(name == "range_max")                      cfg.range_max = param.as_double();
+        else if(name == "beam_width")                     cfg.beam_width = param.as_double();
+        else if(name == "n_samples")                      cfg.n_samples = param.as_int();
+        else if(name == "n_reflections")                  cfg.n_reflections = param.as_int();
+        else if(name == "beam_sample_dist")               cfg.beam_sample_dist = param.as_int();
+        else if(name == "beam_sample_dist_normal_p_in_cone") cfg.beam_sample_dist_normal_p_in_cone = param.as_double();
+        else if(name == "signal_denoising")               cfg.signal_denoising = param.as_int();
+        else if(name == "signal_denoising_triangular_width") cfg.signal_denoising_triangular_width = param.as_int();
+        else if(name == "signal_denoising_triangular_mode")  cfg.signal_denoising_triangular_mode = param.as_int();
+        else if(name == "signal_denoising_gaussian_width")   cfg.signal_denoising_gaussian_width = param.as_int();
+        else if(name == "signal_denoising_gaussian_mode")    cfg.signal_denoising_gaussian_mode = param.as_int();
+        else if(name == "signal_denoising_mb_width")         cfg.signal_denoising_mb_width = param.as_int();
+        else if(name == "signal_denoising_mb_mode")          cfg.signal_denoising_mb_mode = param.as_int();
+        else if(name == "signal_max")                     cfg.signal_max = param.as_double();
+        else if(name == "ambient_noise")                  cfg.ambient_noise = param.as_int();
+        else if(name == "ambient_noise_energy_max")       cfg.ambient_noise_energy_max = param.as_double();
+        else if(name == "ambient_noise_energy_min")       cfg.ambient_noise_energy_min = param.as_double();
+        else if(name == "ambient_noise_energy_loss")      cfg.ambient_noise_energy_loss = param.as_double();
+        else if(name == "ambient_noise_at_signal_0")      cfg.ambient_noise_at_signal_0 = param.as_double();
+        else if(name == "ambient_noise_at_signal_1")      cfg.ambient_noise_at_signal_1 = param.as_double();
+        else if(name == "ambient_noise_perlin_scale_low") cfg.ambient_noise_perlin_scale_low = param.as_double();
+        else if(name == "ambient_noise_perlin_scale_high") cfg.ambient_noise_perlin_scale_high = param.as_double();
+        else if(name == "ambient_noise_perlin_p_low")     cfg.ambient_noise_perlin_p_low = param.as_double();
+        else if(name == "record_multi_reflection")        cfg.record_multi_reflection = param.as_bool();
+        else if(name == "record_multi_path")              cfg.record_multi_path = param.as_bool();
+        else if(name == "multipath_threshold")            cfg.multipath_threshold = param.as_double();
+        else if(name == "include_motion")                 cfg.include_motion = param.as_bool();
+    }
+
+    updateDynCfg(cfg, 0);
+
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    return result;
 }
 
 void RadaRaysOptix::Load(const std::string& world_name)
@@ -310,7 +386,7 @@ void RadaRaysOptix::Load(const std::string& world_name)
 
 void RadaRaysOptix::simulate(rm::Transform Tsm)
 {
-    // 
+    //
     if(m_polar_image.rows != m_cfg.n_cells)
     {
         std::cout << "[RadaRaysOptix] Resize canvas to " << m_cfg.n_cells << std::endl;
@@ -336,7 +412,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                 m_cfg.signal_denoising_triangular_width,
                 denoising_mode
             );
-            
+
         } else if(m_cfg.signal_denoising == 2) {
             // std::cout << "Gaussian";
             denoising_mode = m_cfg.signal_denoising_gaussian_mode * m_cfg.signal_denoising_gaussian_width;
@@ -366,7 +442,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                 denoising_weights[i] /= denoising_mode_val;
             }
         }
-        
+
     }
 
     // upload buffers
@@ -397,9 +473,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     // prepare radar model
 
     size_t n_rays = n_angles * m_cfg.n_samples;
-    // std::cout << "Waves: " << n_rays << std::endl;
-    
-    
+
     rm::OnDnModel waves;
     waves.range = m_radar_model.range;
     waves.dirs.resize(n_rays);
@@ -407,9 +481,6 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     waves.width = n_angles;
     waves.height = m_params.model.n_samples;
     rm::Memory<DirectedWaveAttributes> wave_attributes(n_rays);
-
-
-    // auto samples = sample_cone
 
     rm::Vector front = {1.0, 0.0, 0.0};
     rm::Memory<rm::Vector> ray_dirs_local = sample_cone(
@@ -420,20 +491,15 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
         m_cfg.beam_sample_dist_normal_p_in_cone
     );
 
-    // std::cout << "Filling Model" << std::endl;
-
     for(size_t angle_id=0; angle_id<n_angles; angle_id++)
     {
-        auto orig = m_radar_model.getOrigin(0, angle_id);
-        auto dir = m_radar_model.getDirection(0, angle_id);
-
         rm::Transform Tas;
         Tas.R = rm::EulerAngles{0.0, 0.0, m_radar_model.getTheta(angle_id)};
         Tas.t = m_radar_model.getOrigin(0, angle_id);
 
         for(size_t sample_id = 0; sample_id < m_params.model.n_samples; sample_id++)
         {
-            size_t buf_id = waves.getBufferId(sample_id, angle_id);
+            size_t buf_id = sample_id * waves.width + angle_id;
             waves.dirs[buf_id] = Tas.R * ray_dirs_local[sample_id];
             waves.origs[buf_id] = {0.0, 0.0, 0.0};
             wave_attributes[buf_id] = wave_att_ex;
@@ -457,8 +523,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     }
 
 
-   
-    
+
     // rm::Transform Tsm = Tsm_last;
     rm::Memory<rm::Transform, rm::VRAM_CUDA> Tsms_;
     { // upload
@@ -501,48 +566,29 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             // For each reflection
             // - sim
             // - reflection shader
-            // - if 
+            // - if
             for(size_t i=0; i<m_cfg.n_reflections; i++)
             {
                 m_sim->setModel(m_waves_gpu[i]);
                 // std::cout << "[RadaRaysOptix] Simulate Signals - pass " << i+1 << std::endl;
-                
-                // if(m_map_mutex)
-                // {
-                //     std::cout << "RADARAYS: Lock Map" << std::endl;
-                //     m_map_mutex->lock_shared();
-                // }
-                
+
                 m_sim->simulate(Tsms_, m_results[i]);
-
-                // if(m_map_mutex)
-                // {
-                //     std::cout << "RADARAYS: Unlock Map" << std::endl;
-                //     m_map_mutex->unlock_shared();
-                // }
-
-                // cudaDeviceSynchronize();
-                // el = sw(); el_tot += el;
-                // std::cout << "- ray cast: " << el*1000.0 << "ms" << std::endl;
-                // std::cout << "[RadaRaysOptix] end simulate" << std::endl;
 
                 // sw();
                 move_waves(
                     m_waves_gpu[i].origs,
                     m_waves_gpu[i].dirs,
                     m_wave_attributes_gpu[i],
-                    m_results[i].ranges, 
+                    m_results[i].ranges,
                     m_results[i].hits);
-                // el = sw(); el_tot += el;
 
-                // std::cout << "- move: " << el*1000.0 << "ms" << std::endl;
                 if(m_materials_gpu.size() == 0 || m_object_materials.size() == 0)
                 {
                     std::cout << "[RadaRaysOptix] WARNING. materials or object->materials buffers seam to have wrong sizes" << std::endl;
                     std::cout << "- Materials: " << m_materials_gpu.size() << std::endl;
                     std::cout << "- Objects with materials: " << m_object_materials.size() << std::endl;
                 }
-               
+
                 // sw();
                 signal_shader(
                     m_materials_gpu,
@@ -554,7 +600,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                     m_results[i].hits,
                     m_results[i].normals,
                     m_results[i].object_ids,
-                    
+
                     m_signals[i]
                 );
 
@@ -566,7 +612,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                     auto lo = m_waves_gpu[i+1].origs(0, m_waves_gpu[i].origs.size());
                     auto ld = m_waves_gpu[i+1].dirs(0, m_waves_gpu[i].dirs.size());
                     auto la = m_wave_attributes_gpu[i+1](0, m_wave_attributes_gpu[i].size());
-                    
+
                     auto ro = m_waves_gpu[i+1].origs(m_waves_gpu[i].origs.size(), m_waves_gpu[i].origs.size() * 2);
                     auto rd = m_waves_gpu[i+1].dirs(m_waves_gpu[i].dirs.size(), m_waves_gpu[i].dirs.size() * 2);
                     auto ra = m_wave_attributes_gpu[i+1](m_wave_attributes_gpu[i].size(), m_wave_attributes_gpu[i].size() * 2);
@@ -590,10 +636,10 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                     // cudaDeviceSynchronize();
                 } // fresnel split
             }
-        }  
+        }
     }
     // el1 = sw(); el_tot += el1;
-    
+
     // std::cout << "RUNTIME" << std::endl;
     // std::cout << "- Signal Gen: " << el1 << "s" << std::endl;
 
@@ -623,7 +669,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     // sw();
     {
         size_t n_samples = m_cfg.n_samples;
-        
+
         #pragma omp parallel for
         for(size_t angle_id_ = 0; angle_id_ < n_angles; angle_id_++)
         {
@@ -632,21 +678,22 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             unsigned int img_offset = angle_id * n_cells;
 
             float max_val = 0.0;
-            unsigned int signal_count = 0;    
+            unsigned int signal_count = 0;
 
             for(size_t pass_id=0; pass_id < m_cfg.n_reflections; pass_id++)
             {
-                // Draw signals to slice
-                // draw signals 1
                 int size_factor = std::pow(2, pass_id);
+
                 for(size_t sample_id=0; sample_id < n_samples * size_factor; sample_id++)
                 {
                     const unsigned int signal_id = sample_id * n_angles + angle_id;
 
+                    if(signal_id >= hits_cpu[pass_id].size())
+                        continue;
+
                     if(hits_cpu[pass_id][signal_id])
                     {
                         auto signal = signals_cpu[pass_id][signal_id];
-                        // wave speed in air (light speed) * t / 2
                         float half_time = signal.time / 2.0;
                         float signal_dist = 0.3 * half_time;
 
@@ -655,13 +702,11 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                         {
                             if(m_cfg.signal_denoising > 0)
                             {
-                                // signal denoising
                                 for(int vid = 0; vid < denoising_weights.size(); vid++)
                                 {
                                     int glob_id = vid + cell - denoising_mode;
                                     if(glob_id > 0 && glob_id < n_cells)
                                     {
-                                        // TODO: check this
                                         const float old_val = img[img_offset + glob_id];
                                         const float new_val = old_val + signal.strength * denoising_weights[vid];
                                         img[img_offset + glob_id] = new_val;
@@ -673,8 +718,6 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                                     }
                                 }
                             } else {
-                                // read 
-                                // TODO: check this
                                 const float old_val = img[img_offset + cell];
                                 const float new_val = std::max(old_val, (float)signal.strength);
                                 img[img_offset + cell] = new_val;
@@ -694,12 +737,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             max_vals[angle_id] = max_val;
             signal_counts[angle_id] = signal_count;
         }
-    
-        // cudaDeviceSynchronize();
-        // el2 = sw(); el_tot += el2;
 
-        // 3. ambient noise
-        // sw();
         if(m_cfg.ambient_noise)
         {
             std::random_device                      rand_dev;
@@ -709,12 +747,12 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             for(size_t i=0; i<n_angles; i++)
             {
                 max_vals[i] = std::max(
-                    (float)m_cfg.ambient_noise_energy_max, 
+                    (float)m_cfg.ambient_noise_energy_max,
                     max_vals[i]);
-                
+
                 random_begins[i] = dist_uni(gen) * 1000.0;
             }
-            
+
             AmbientNoiseParams noise_params;
             noise_params.noise_at_signal_0 = m_cfg.ambient_noise_at_signal_0;
             noise_params.noise_at_signal_1 = m_cfg.ambient_noise_at_signal_1;
@@ -723,13 +761,10 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             noise_params.noise_energy_max = m_cfg.ambient_noise_energy_max;
             noise_params.resolution = m_cfg.resolution;
 
-            // apply noise
-            // low freq perlin
             double scale_low = m_cfg.ambient_noise_perlin_scale_low;
-            // high freq perlin
             double scale_high = m_cfg.ambient_noise_perlin_scale_high;
             double p_low = m_cfg.ambient_noise_perlin_p_low;
-            
+
             fill_perlin_noise_hilo(
                 img, max_vals,
                 n_angles, n_cells,
@@ -740,16 +775,14 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             );
             cudaDeviceSynchronize();
         }
-        // el3 = sw(); el_tot += el3;
 
-        // float max_signal = 120.0;
         float max_signal = m_cfg.signal_max;
         cv::Mat_<float> polar_img_f(n_cells, n_angles);
 
         for(size_t x=0; x<n_angles; x++)
         {
             float max_val = max_vals[x];
-            
+
             for(size_t y=0; y<n_cells; y++)
             {
                 polar_img_f.at<float>(y, x) = img[x * n_cells + y] * max_signal / max_val;
@@ -757,7 +790,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
         }
         polar_img_f.convertTo(m_polar_image, CV_8UC1);
     }
-    
+
     // std::cout << std::fixed << std::setprecision(8) << el1/el_tot << ", " << el2/el_tot << ", " << el3/el_tot << ", " << el_tot << std::endl;
 }
 
@@ -782,11 +815,11 @@ bool RadaRaysOptix::UpdateImpl(const bool _force)
             // m_map->context()->getCudaContext()->use();
             m_sim = std::make_shared<rm::OnDnSimulatorOptix>(m_map);
             std::cout << "[RadaRaysOptix] OnDnSimulator constructed." << std::endl;
-            
+
             // m_sim->setMap(m_map);
             m_sim->setTsb(rm::Transform::Identity());
             std::cout << "[RadaRaysOptix] OnDnSimulator map set." << std::endl;
-            
+
             m_sim->preBuildProgram<ResT>();
         }
 
@@ -855,7 +888,7 @@ void RadaRaysOptix::initWorkMemory()
         }
 
         m_wave_attributes_gpu[0].resize(n_rays);
-        
+
         rm::resize_memory_bundle<rm::VRAM_CUDA>(
             m_results[0], m_waves_gpu[0].width, m_waves_gpu[0].height, 1);
         m_signals[0].resize(m_waves_gpu[0].size());
@@ -880,7 +913,7 @@ void RadaRaysOptix::initWorkMemory()
 
             rm::resize_memory_bundle<rm::VRAM_CUDA>(
                 m_results[i], m_waves_gpu[i].width, m_waves_gpu[i].height, 1);
-            
+
             m_signals[i].resize(m_waves_gpu[i].size());
             m_signal_mask[i].resize(m_waves_gpu[i].size());
         }
@@ -891,14 +924,14 @@ void RadaRaysOptix::updateDynCfg(
     radarays_ros::RadarModelConfig &config,
     uint32_t level)
 {
-    ROS_INFO("RadaRaysOptix - Changing Model");
-    
+    RCLCPP_INFO(m_nh_p->get_logger(), "RadaRaysOptix - Changing Model");
+
     // z_offset
     // auto T = rm::Transform::Identity();
     // T.t.z = config.z_offset;
     // sim->setTsb(T);
 
-    if(   config.beam_sample_dist != m_cfg.beam_sample_dist 
+    if(   config.beam_sample_dist != m_cfg.beam_sample_dist
         || abs(config.beam_width - m_cfg.beam_width ) > 0.001
         || config.n_samples != m_cfg.n_samples
         || abs(config.beam_sample_dist_normal_p_in_cone - m_cfg.beam_sample_dist_normal_p_in_cone) > 0.001
@@ -914,9 +947,9 @@ void RadaRaysOptix::updateDynCfg(
     // update params model
     m_params.model.beam_width = config.beam_width * M_PI / 180.0;
     m_params.model.n_samples = config.n_samples;
-    
+
     bool buffer_reinit = (config.n_reflections != m_params.model.n_reflections);
-    
+
     m_params.model.n_reflections = config.n_reflections;
 
     m_cfg = config;

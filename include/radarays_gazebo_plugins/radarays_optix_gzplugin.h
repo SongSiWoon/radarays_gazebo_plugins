@@ -1,7 +1,9 @@
 #ifndef GAZEBO_RADARAYS_OPTIX_PLUGIN_H
 #define GAZEBO_RADARAYS_OPTIX_PLUGIN_H
 
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
+#include <gazebo_ros/node.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 
 #include <gazebo/physics/physics.hh>
 #include <gazebo/common/common.hh>
@@ -26,13 +28,10 @@
 #include <rmagine_gazebo_plugins/rmagine_optix_spherical_gzplugin.h>
 
 #include <radarays_ros/Radar.hpp>
-#include <radarays_ros/RadarMaterials.h>
-#include <radarays_ros/RadarModelConfig.h>
-#include <radarays_ros/RadarParams.h>
+#include <radarays_ros/msg/radar_materials.hpp>
+#include <radarays_ros/RadarModelConfig.hpp>
+#include <radarays_ros/msg/radar_params.hpp>
 #include <radarays_ros/radar_types.h>
-
-#include <dynamic_reconfigure/server.h>
-
 
 namespace rm = rmagine;
 
@@ -79,14 +78,17 @@ protected:
 // For Radar
     void updateDynCfg(radarays_ros::RadarModelConfig &config, uint32_t level);
 
-    // ROS NODE
-    std::shared_ptr<ros::NodeHandle> m_nh_p;
+    rcl_interfaces::msg::SetParametersResult onParameterChange(
+        const std::vector<rclcpp::Parameter>& params);
 
-    // DynRec
-    std::shared_ptr<dynamic_reconfigure::Server<radarays_ros::RadarModelConfig> > m_dyn_rec_server;
+    // ROS NODE
+    rclcpp::Node::SharedPtr m_nh_p;
+
+    // Parameter callback handle
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr m_param_callback;
 
      // Params
-    radarays_ros::RadarParams m_params;
+    radarays_ros::msg::RadarParams m_params;
     rm::SphericalModel m_radar_model;
     radarays_ros::RadarModelConfig m_cfg;
 
@@ -100,7 +102,7 @@ protected:
 
     // global GPU buffers
     rm::Memory<int, rm::VRAM_CUDA> m_object_materials_gpu;
-    rm::Memory<radarays_ros::RadarMaterial, rm::VRAM_CUDA> m_materials_gpu;
+    rm::Memory<radarays_ros::msg::RadarMaterial, rm::VRAM_CUDA> m_materials_gpu;
 
     // preallocated memory for faster mem handling
     std::vector<rm::OnDnModel_<rm::VRAM_CUDA> > m_waves_gpu;

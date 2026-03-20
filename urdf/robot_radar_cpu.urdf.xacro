@@ -186,19 +186,23 @@
 
 <!-- Odom -->
 <gazebo>
-  <plugin name="skid_steer_drive_controller" filename="libgazebo_ros_skid_steer_drive.so">
-    <updateRate>100.0</updateRate>
-    <robotNamespace>/</robotNamespace>
-    <leftFrontJoint>left_front_wheel_joint</leftFrontJoint>
-    <rightFrontJoint>right_front_wheel_joint</rightFrontJoint>
-    <leftRearJoint>left_rear_wheel_joint</leftRearJoint>
-    <rightRearJoint>right_rear_wheel_joint</rightRearJoint>
-    <wheelSeparation>${axis_length}</wheelSeparation>
-    <wheelDiameter>${2*wheel_radius}</wheelDiameter>
-    <robotBaseFrame>base_link</robotBaseFrame>
-    <torque>30</torque>
-    <topicName>cmd_vel</topicName>
-    <broadcastTF>false</broadcastTF>
+  <plugin name="skid_steer_drive_controller" filename="libgazebo_ros_diff_drive.so">
+    <update_rate>100.0</update_rate>
+    <num_wheel_pairs>2</num_wheel_pairs>
+    <left_joint>left_front_wheel_joint</left_joint>
+    <left_joint>left_rear_wheel_joint</left_joint>
+    <right_joint>right_front_wheel_joint</right_joint>
+    <right_joint>right_rear_wheel_joint</right_joint>
+    <wheel_separation>${axis_length}</wheel_separation>
+    <wheel_diameter>${2*wheel_radius}</wheel_diameter>
+    <robot_base_frame>base_link</robot_base_frame>
+    <max_wheel_torque>30</max_wheel_torque>
+    <command_topic>cmd_vel</command_topic>
+    <publish_odom>true</publish_odom>
+    <publish_odom_tf>false</publish_odom_tf>
+    <publish_wheel_tf>false</publish_wheel_tf>
+    <odometry_topic>odom</odometry_topic>
+    <odometry_frame>odom</odometry_frame>
   </plugin>
 </gazebo>
 
@@ -216,18 +220,29 @@
 </link>
 
 <!-- inertial measurement unit for gazebo -->
-<gazebo>
-    <plugin name="imu_controller" filename="libgazebo_ros_imu.so">
-    <alwaysOn>true</alwaysOn>
-    <updateRate>100.0</updateRate>
-    <bodyName>imu</bodyName>
-    <topicName>imu/data</topicName>
-    <serviceName>/default_imu</serviceName>
-    <gaussianNoise>${imu_stdev*imu_stdev}</gaussianNoise>
-    <xyzOffsets>0 0 0</xyzOffsets> 
-    <rpyOffsets>0 0 0</rpyOffsets>
-    <interface:position name="imu_position"/>
+<gazebo reference="imu">
+    <sensor name="imu_sensor" type="imu">
+    <always_on>true</always_on>
+    <update_rate>100.0</update_rate>
+    <imu>
+      <angular_velocity>
+        <x><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></x>
+        <y><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></y>
+        <z><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></z>
+      </angular_velocity>
+      <linear_acceleration>
+        <x><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></x>
+        <y><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></y>
+        <z><noise type="gaussian"><stddev>${imu_stdev}</stddev></noise></z>
+      </linear_acceleration>
+    </imu>
+    <plugin name="imu_controller" filename="libgazebo_ros_imu_sensor.so">
+      <ros>
+        <remapping>~/out:=imu/data</remapping>
+      </ros>
+      <frame_name>imu</frame_name>
     </plugin>
+    </sensor>
 </gazebo>
 
 <joint name="imu_to_base_joint" type="fixed">
@@ -263,7 +278,7 @@
   <sensor type="radarays_embree" name="radar">
     <pose>0 0 0 0 0 0</pose>
     <always_on>true</always_on>
-    <update_rate>4</update_rate>
+    <update_rate>15</update_rate>
 
     <ray>
       <scan>
@@ -290,13 +305,13 @@
 <!-- publish ground truth for pose of base_footprint -->
 <gazebo>
     <plugin name="base_footprint_controller" filename="libgazebo_ros_p3d.so">
-    <alwaysOn>true</alwaysOn>
-    <updateRate>30.0</updateRate>
-    <bodyName>base_footprint</bodyName>
-    <topicName>base_footprint_pose_ground_truth</topicName>
-    <gaussianNoise>0.0</gaussianNoise>
-    <frameName>map</frameName>
-    <interface:position name="base_footprint_p3d_position_iface" />
+    <ros>
+      <remapping>odom:=base_footprint_pose_ground_truth</remapping>
+    </ros>
+    <update_rate>30.0</update_rate>
+    <body_name>base_footprint</body_name>
+    <gaussian_noise>0.0</gaussian_noise>
+    <frame_name>map</frame_name>
     </plugin>
 </gazebo>
 
