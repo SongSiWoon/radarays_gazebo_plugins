@@ -50,11 +50,22 @@ private:
 
     image_transport::Publisher m_pub_img;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_pub_pc;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_pub_pc_gt;
+
+    // heat maps, 32FC1 images in dB, only computed while subscribed
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr m_pub_heat_rd;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr m_pub_heat_ra;
+    void publishHeatmap(
+        const rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr& pub,
+        const radarays_gazebo_plugins::RadarDetector::Heatmap& map,
+        const std_msgs::msg::Header& header);
 
     std::string m_frame_id;
     std::string m_topic;
     std::string m_pc_topic;
+    std::string m_pc_gt_topic;
 
+    std::string m_doppler_field = "v_doppler";
     float m_pc_fov_min = -M_PI;
     float m_pc_fov_max = M_PI;
 

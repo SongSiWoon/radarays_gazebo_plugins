@@ -16,7 +16,7 @@
 #include <radarays_ros/radar_algorithms.h>
 #include <radarays_ros/image_algorithms.h>
 #include <cv_bridge/cv_bridge.h>
-#include <omp.h>
+#include <random>
 
 #include <rmagine/util/StopWatch.hpp>
 #include <rmagine/util/prints.h>
@@ -55,8 +55,51 @@ RadaRaysEmbree::~RadaRaysEmbree()
     gzdbg << "[RadaRaysEmbree] Destroyed." << std::endl;
 }
 
+void RadaRaysEmbree::loadDetectorSDF()
+{
+    // default reflection of surfaces without <radarays_material>:
+    // weak angle independent scattering plus a lobe around the surface normal
+    m_default_material.velocity = 0.0;  // opaque
+    m_default_material.ambient  = 0.1;
+    m_default_material.diffuse  = 1.0;
+    m_default_material.specular = 20.0;
+
+    if(this->sdf->HasElement("default_material"))
+    {
+        sdf::ElementPtr mat = this->sdf->GetElement("default_material");
+        if(mat->HasElement("velocity")) m_default_material.velocity = mat->Get<float>("velocity");
+        if(mat->HasElement("ambient"))  m_default_material.ambient = mat->Get<float>("ambient");
+        if(mat->HasElement("diffuse"))  m_default_material.diffuse = mat->Get<float>("diffuse");
+        if(mat->HasElement("specular")) m_default_material.specular = mat->Get<float>("specular");
+    }
+
+    // ray tracing effort, defaults of the ROS parameters with the same names
+    if(this->sdf->HasElement("ray_tracing"))
+    {
+        sdf::ElementPtr rt = this->sdf->GetElement("ray_tracing");
+        if(rt->HasElement("n_samples"))     m_sdf_n_samples = rt->Get<int>("n_samples");
+        if(rt->HasElement("n_reflections")) m_sdf_n_reflections = rt->Get<int>("n_reflections");
+        if(rt->HasElement("beam_width"))    m_sdf_beam_width = rt->Get<double>("beam_width");
+        if(rt->HasElement("self_clearance")) m_self_clearance = rt->Get<double>("self_clearance");
+    }
+
+    if(this->sdf->HasElement("radar_detector"))
+    {
+        sdf::ElementPtr det = this->sdf->GetElement("radar_detector");
+        for(auto& elem : m_detector.params.fields())
+        {
+            if(det->HasElement(elem.first))
+            {
+                *elem.second = det->Get<double>(elem.first);
+            }
+        }
+    }
+}
+
 void RadaRaysEmbree::loadParamsSDF()
 {
+    loadDetectorSDF();
+
     if (!this->sdf->HasElement("ray")) {
         return;
     }
@@ -67,16 +110,15 @@ void RadaRaysEmbree::loadParamsSDF()
         if (scanElem->HasElement("horizontal")) {
             auto h = scanElem->GetElement("horizontal");
             m_radar_model.theta.size = h->Get<int>("samples");
-            // theta.inc and theta.min define the full-circle radar sweep
-            // keep the default inc = -(2*PI)/size, don't use SDF increment
-            m_radar_model.theta.inc = -(2.0 * M_PI) / m_radar_model.theta.size;
+            m_radar_model.theta.min = h->Get<float>("min_angle");
+            m_radar_model.theta.inc = h->Get<float>("increment");
         }
         if (scanElem->HasElement("vertical")) {
             auto v = scanElem->GetElement("vertical");
             m_radar_model.phi.min = v->Get<float>("min_angle");
             m_radar_model.phi.inc = v->Get<float>("increment");
             m_radar_model.phi.size = v->Get<int>("samples");
-            std::cout << "[RadaRaysEmbree] Loaded vertical scan: phi.min="
+            gzdbg << "[RadaRaysEmbree] Loaded vertical scan: phi.min="
                 << m_radar_model.phi.min << " phi.inc=" << m_radar_model.phi.inc
                 << " phi.size=" << m_radar_model.phi.size << std::endl;
         }
@@ -115,10 +157,7 @@ void RadaRaysEmbree::loadParams()
         material_air.specular = 1.0;
         m_params.materials.data[0] = material_air;
         radarays_ros::msg::RadarMaterial material_wall_stone;
-        material_wall_stone.velocity = 0.0;
-        material_wall_stone.ambient  = 1.0;
-        material_wall_stone.diffuse  = 0.0;
-        material_wall_stone.specular = 3000.0;
+        material_wall_stone = m_default_material;
         m_params.materials.data[1] = material_wall_stone;
     }
 
@@ -139,48 +178,28 @@ void RadaRaysEmbree::loadParams()
     m_polar_image = cv::Mat_<unsigned char>(0, m_radar_model.theta.size);
 
 
-
-
     loadParamsSDF();
-
 
 
     // material properties
     
     
-    // TODO:
-    // this is how it was in a static environment:
-    // 
-    // m_params.materials = loadRadarMaterialsFromParameterServer(m_nh_p);
-    // m_nh_p->getParam("object_materials", m_object_materials);
-    // m_nh_p->getParam("material_id_air", m_material_id_air);
-    // 
-    // But Gazebo environments are changing. Maybe we can fetch custom 
-    // materials from Gazebo? 
-    // - A first quick solution would be to pass a list of materials
-    //   as before and does not allow to change the world (at own risk)
-    // 
-    // Or maybe: For each object spawn something is added to 
-    //   dynamic reconfigure?
 
 
-
-
-
-    // TODO: load additional params from gazebo - xml (instead of ros paremeters)
 }
 
 void RadaRaysEmbree::searchForMaterials()
 {
     m_object_materials.resize(0);
-    m_params.materials.data.resize(1);
+    // 0: air, 1: default for objects without <radarays_material>
+    m_params.materials.data.resize(2);
     radarays_ros::msg::RadarMaterial material_air;
     material_air.velocity = 0.3; // m/ns
     material_air.ambient  = 1.0;
     material_air.diffuse  = 0.0;
     material_air.specular = 1.0;
     m_params.materials.data[0] = material_air;
-
+    m_params.materials.data[1] = m_default_material;
 
 
     sdf::ElementPtr world_sdf = this->world->SDF();
@@ -205,24 +224,24 @@ void RadaRaysEmbree::searchForMaterials()
             {
                 std::string vis_name = vis_sdf->GetAttribute("name")->GetAsString();
                 
-                sdf::ElementPtr mat_sdf = vis_sdf->GetElement("radarays_material");
+                sdf::ElementPtr mat_sdf;
+                if(vis_sdf->HasElement("radarays_material"))
+                {
+                    mat_sdf = vis_sdf->GetElement("radarays_material");
+                }
 
                 radarays_ros::msg::RadarMaterial material;
                 
                 if(mat_sdf)
                 {
-                    std::cout << "Found RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
+                    gzdbg << "Found RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
                     material.velocity = mat_sdf->Get<float>("velocity");
                     material.ambient = mat_sdf->Get<float>("ambient");
                     material.diffuse = mat_sdf->Get<float>("diffuse");
                     material.specular = mat_sdf->Get<float>("specular");
                 } else {
                     // wall stone? defaults
-                    std::cout << "-- Setting RadaRays materials to defaults" << std::endl;
-                    material.velocity = 0.0;
-                    material.ambient  = 1.0;
-                    material.diffuse  = 0.0;
-                    material.specular = 3000.0;
+                    material = m_default_material;
                 }
                     
 
@@ -239,19 +258,20 @@ void RadaRaysEmbree::searchForMaterials()
                 int obj_id = -1;
                 if(m_map)
                 {
-                    std::cout << "SEARCH FOR: " << name << std::endl;
                     for(auto elem : m_map->scene->geometries())
                     {
-                        std::cout << elem.first << ".: " << elem.second->name << std::endl;
                         if(elem.second->name == name)
                         {
-                            std::cout << "FOUND OBJ ID: " << elem.first << std::endl;
                             obj_id = elem.first;
                             break;
                         }
                     }
                 } else {
-                    std::cout << "ERROR: no embree map" << std::endl;
+                    gzdbg << "ERROR: no embree map" << std::endl;
+                    if(m_map_mutex)
+                    {
+                        m_map_mutex->unlock_shared();
+                    }
                     continue;
                 }
 
@@ -260,30 +280,22 @@ void RadaRaysEmbree::searchForMaterials()
                     m_map_mutex->unlock_shared();
                 }
 
-                std::cout << "FOUND MODEL: " << name << std::endl;
                 if(obj_id >= 0)
                 {
-                    std::cout << " -> embree map geometry id: " << obj_id << std::endl;
 
                     m_params.materials.data.push_back(material);
                     size_t mat_id = m_params.materials.data.size() - 1;
 
-                    // fill with unknown with air materials
-                    while(m_object_materials.size() <= obj_id)
+                    // objects without a material entry use the default
+                    while(m_object_materials.size() <= static_cast<size_t>(obj_id))
                     {
-                        m_object_materials.push_back(0);
+                        m_object_materials.push_back(1);
                     }
                     // object -> material
                     m_object_materials[obj_id] = mat_id;
                 }
             }
         }
-        
-        // TODO:
-        // full_name = model/link/...
-        // put full name to embree map elements and compare instead
-        // thus, we can apply materials to model parts
-        
     }
 
 }
@@ -292,19 +304,32 @@ void RadaRaysEmbree::Init()
 {
     Base::Init();
 
-    m_nh_p = gazebo_ros::Node::Get(this->sdf);
+    // The parameter node lives in the namespace of the robot (the ROS plugin
+    // of this sensor carries it), so several drones do not share "/radar".
+    sdf::ElementPtr node_sdf = this->sdf;
+    if(this->sdf->HasElement("plugin"))
+    {
+        sdf::ElementPtr plugin_sdf = this->sdf->GetElement("plugin");
+        if(plugin_sdf->HasElement("ros"))
+        {
+            node_sdf = plugin_sdf;
+        }
+    }
+    m_nh_p = gazebo_ros::Node::Get(node_sdf, "radar");
 
     loadParams();
 
     // Declare ROS2 parameters (radar model config)
-    m_nh_p->declare_parameter("n_cells", 200);
-    m_nh_p->declare_parameter("resolution", 0.1);
+    const double default_resolution = m_detector.params.range_resolution;
+    m_nh_p->declare_parameter("n_cells",
+        static_cast<int>(std::ceil(m_radar_model.range.max / default_resolution)));
+    m_nh_p->declare_parameter("resolution", default_resolution);
     m_nh_p->declare_parameter("scroll_image", 0);
-    m_nh_p->declare_parameter("range_min", 0.2);
-    m_nh_p->declare_parameter("range_max", 100.0);
-    m_nh_p->declare_parameter("beam_width", 3.0);
-    m_nh_p->declare_parameter("n_samples", 10);
-    m_nh_p->declare_parameter("n_reflections", 1);
+    m_nh_p->declare_parameter("range_min", static_cast<double>(m_radar_model.range.min));
+    m_nh_p->declare_parameter("range_max", static_cast<double>(m_radar_model.range.max));
+    m_nh_p->declare_parameter("beam_width", m_sdf_beam_width);
+    m_nh_p->declare_parameter("n_samples", m_sdf_n_samples);
+    m_nh_p->declare_parameter("n_reflections", m_sdf_n_reflections);
     m_nh_p->declare_parameter("beam_sample_dist", 0);
     m_nh_p->declare_parameter("beam_sample_dist_normal_p_in_cone", 1.0);
     m_nh_p->declare_parameter("signal_denoising", 0);
@@ -324,14 +349,58 @@ void RadaRaysEmbree::Init()
     m_nh_p->declare_parameter("ambient_noise_perlin_scale_low", 0.01);
     m_nh_p->declare_parameter("ambient_noise_perlin_scale_high", 0.1);
     m_nh_p->declare_parameter("ambient_noise_perlin_p_low", 0.5);
-    m_nh_p->declare_parameter("record_multi_reflection", false);
+    m_nh_p->declare_parameter("record_multi_reflection", true);
     m_nh_p->declare_parameter("record_multi_path", false);
     m_nh_p->declare_parameter("multipath_threshold", 0.9);
     m_nh_p->declare_parameter("include_motion", false);
+    m_nh_p->declare_parameter("resample_every_frame", false);
+
+    // Pointcloud noise parameters
+    // Detection model: SDF values are the defaults, tunable at runtime
+    for(auto& elem : m_detector.params.fields())
+    {
+        m_nh_p->declare_parameter("det." + elem.first, *elem.second);
+    }
 
     // Apply initial config from parameters
     radarays_ros::RadarModelConfig initial_cfg;
-    updateDynCfg(initial_cfg, 0);
+    initial_cfg.beam_width = m_nh_p->get_parameter("beam_width").as_double();
+    initial_cfg.n_samples = m_nh_p->get_parameter("n_samples").as_int();
+    initial_cfg.n_reflections = m_nh_p->get_parameter("n_reflections").as_int();
+    initial_cfg.range_min = m_nh_p->get_parameter("range_min").as_double();
+    initial_cfg.range_max = m_nh_p->get_parameter("range_max").as_double();
+    initial_cfg.resolution = m_nh_p->get_parameter("resolution").as_double();
+    initial_cfg.n_cells = m_nh_p->get_parameter("n_cells").as_int();
+    initial_cfg.signal_max = m_nh_p->get_parameter("signal_max").as_double();
+    // every declared value is applied: "ros2 param get" shows what is simulated
+    initial_cfg.scroll_image = m_nh_p->get_parameter("scroll_image").as_int();
+    initial_cfg.beam_sample_dist = m_nh_p->get_parameter("beam_sample_dist").as_int();
+    initial_cfg.beam_sample_dist_normal_p_in_cone = m_nh_p->get_parameter("beam_sample_dist_normal_p_in_cone").as_double();
+    initial_cfg.signal_denoising = m_nh_p->get_parameter("signal_denoising").as_int();
+    initial_cfg.signal_denoising_triangular_width = m_nh_p->get_parameter("signal_denoising_triangular_width").as_int();
+    initial_cfg.signal_denoising_triangular_mode = m_nh_p->get_parameter("signal_denoising_triangular_mode").as_int();
+    initial_cfg.signal_denoising_gaussian_width = m_nh_p->get_parameter("signal_denoising_gaussian_width").as_int();
+    initial_cfg.signal_denoising_gaussian_mode = m_nh_p->get_parameter("signal_denoising_gaussian_mode").as_int();
+    initial_cfg.signal_denoising_mb_width = m_nh_p->get_parameter("signal_denoising_mb_width").as_int();
+    initial_cfg.signal_denoising_mb_mode = m_nh_p->get_parameter("signal_denoising_mb_mode").as_int();
+    initial_cfg.ambient_noise = m_nh_p->get_parameter("ambient_noise").as_int();
+    initial_cfg.ambient_noise_energy_max = m_nh_p->get_parameter("ambient_noise_energy_max").as_double();
+    initial_cfg.ambient_noise_energy_min = m_nh_p->get_parameter("ambient_noise_energy_min").as_double();
+    initial_cfg.ambient_noise_energy_loss = m_nh_p->get_parameter("ambient_noise_energy_loss").as_double();
+    initial_cfg.ambient_noise_at_signal_0 = m_nh_p->get_parameter("ambient_noise_at_signal_0").as_double();
+    initial_cfg.ambient_noise_at_signal_1 = m_nh_p->get_parameter("ambient_noise_at_signal_1").as_double();
+    initial_cfg.ambient_noise_perlin_scale_low = m_nh_p->get_parameter("ambient_noise_perlin_scale_low").as_double();
+    initial_cfg.ambient_noise_perlin_scale_high = m_nh_p->get_parameter("ambient_noise_perlin_scale_high").as_double();
+    initial_cfg.ambient_noise_perlin_p_low = m_nh_p->get_parameter("ambient_noise_perlin_p_low").as_double();
+    initial_cfg.record_multi_reflection = m_nh_p->get_parameter("record_multi_reflection").as_bool();
+    initial_cfg.record_multi_path = m_nh_p->get_parameter("record_multi_path").as_bool();
+    initial_cfg.multipath_threshold = m_nh_p->get_parameter("multipath_threshold").as_double();
+    initial_cfg.include_motion = m_nh_p->get_parameter("include_motion").as_bool();
+    m_resample_every_frame = m_nh_p->get_parameter("resample_every_frame").as_bool();
+    {
+        std::lock_guard<std::mutex> lock(m_cfg_mutex);
+        updateDynCfg(initial_cfg, 0);
+    }
 
     // Register parameter change callback
     m_param_callback = m_nh_p->add_on_set_parameters_callback(
@@ -346,12 +415,46 @@ void RadaRaysEmbree::Init()
 rcl_interfaces::msg::SetParametersResult RadaRaysEmbree::onParameterChange(
     const std::vector<rclcpp::Parameter>& params)
 {
+    for(const auto& param : params)
+    {
+        const std::string& name = param.get_name();
+        std::string reason;
+        if((name == "n_samples" || name == "n_reflections") && param.as_int() < 1)
+        {
+            reason = name + " must be >= 1";
+        }
+        else if(name.rfind("det.", 0) == 0)
+        {
+            reason = radarays_gazebo_plugins::checkDetectorParam(name.substr(4), param.as_double());
+        }
+        if(!reason.empty())
+        {
+            rcl_interfaces::msg::SetParametersResult rejected;
+            rejected.successful = false;
+            rejected.reason = reason;
+            return rejected;
+        }
+    }
+
+    // the sensor thread reads the configuration while simulating
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+
     radarays_ros::RadarModelConfig cfg = m_cfg;
 
     for(const auto& param : params)
     {
         const std::string& name = param.get_name();
-        if(name == "n_cells")                              cfg.n_cells = param.as_int();
+        if(name.rfind("det.", 0) == 0)
+        {
+            for(auto& elem : m_detector.params.fields())
+            {
+                if(elem.first == name.substr(4))
+                {
+                    *elem.second = param.as_double();
+                }
+            }
+        }
+        else if(name == "n_cells")                              cfg.n_cells = param.as_int();
         else if(name == "resolution")                     cfg.resolution = param.as_double();
         else if(name == "scroll_image")                   cfg.scroll_image = param.as_int();
         else if(name == "range_min")                      cfg.range_min = param.as_double();
@@ -382,6 +485,7 @@ rcl_interfaces::msg::SetParametersResult RadaRaysEmbree::onParameterChange(
         else if(name == "record_multi_path")              cfg.record_multi_path = param.as_bool();
         else if(name == "multipath_threshold")            cfg.multipath_threshold = param.as_double();
         else if(name == "include_motion")                 cfg.include_motion = param.as_bool();
+        else if(name == "resample_every_frame")          m_resample_every_frame = param.as_bool();
     }
 
     updateDynCfg(cfg, 0);
@@ -394,7 +498,7 @@ rcl_interfaces::msg::SetParametersResult RadaRaysEmbree::onParameterChange(
 void RadaRaysEmbree::Load(const std::string& world_name)
 {
     Base::Load(world_name);
-    std::cout << "LOAD - RadaRaysEmbree!" << std::endl;
+    gzdbg << "LOAD - RadaRaysEmbree!" << std::endl;
 }
 
 void RadaRaysEmbree::simulate(rm::Transform Tsm)
@@ -402,13 +506,11 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
     // 
     if(m_polar_image.rows != m_cfg.n_cells)
     {
-        // m_polar_image = cv::Mat_<unsigned char>(n_cells, radar_model.theta.size);
-        std::cout << "[RadaRaysEmbree] Resize canvas to " << m_cfg.n_cells << std::endl;
+        gzdbg << "[RadaRaysEmbree] Resize canvas to " << m_cfg.n_cells << std::endl;
         m_polar_image.resize(m_cfg.n_cells);
-        std::cout << "[RadaRaysEmbree] Resizing canvas - done." << std::endl;
+        gzdbg << "[RadaRaysEmbree] Resizing canvas - done." << std::endl;
     }
 
-    // std::cout << "Fill canvas: " << m_polar_image.cols << "x" << m_polar_image.rows << std::endl;
     m_polar_image.setTo(cv::Scalar(0));
 
     std::vector<float> denoising_weights;
@@ -416,10 +518,8 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
 
     if(m_cfg.signal_denoising > 0)
     {
-        // std::cout << "Signal Denoising: ";
         if(m_cfg.signal_denoising == 1)
         {
-            // std::cout << "Triangular";
             denoising_mode = m_cfg.signal_denoising_triangular_mode * m_cfg.signal_denoising_triangular_width;
             denoising_weights = make_denoiser_triangular(
                 m_cfg.signal_denoising_triangular_width,
@@ -427,7 +527,6 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             );
             
         } else if(m_cfg.signal_denoising == 2) {
-            // std::cout << "Gaussian";
             denoising_mode = m_cfg.signal_denoising_gaussian_mode * m_cfg.signal_denoising_gaussian_width;
             denoising_weights = make_denoiser_gaussian(
                 m_cfg.signal_denoising_gaussian_width,
@@ -435,17 +534,14 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             );
 
         } else if(m_cfg.signal_denoising == 3) {
-            // std::cout << "Maxwell Boltzmann";
             denoising_mode = m_cfg.signal_denoising_mb_mode * m_cfg.signal_denoising_mb_width;
             denoising_weights = make_denoiser_maxwell_boltzmann(
                 m_cfg.signal_denoising_mb_width,
                 denoising_mode
             );
         }
-        // std::cout << std::endl;
 
         // scale so that mode has weight 1
-        // if(false)
         if(denoising_weights.size() > 0)
         {
             double denoising_mode_val = denoising_weights[denoising_mode];
@@ -469,27 +565,11 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
     wave.ray.orig = {0.0, 0.0, 0.0};
     wave.ray.dir = {1.0, 0.0, 0.0};
 
-    // el = sw();
 
-    int n_cells = m_polar_image.rows;
-    int n_angles = m_polar_image.cols;
-
-    // std::random_device                      rand_dev;
-    // std::mt19937                            gen(rand_dev());
-    // std::uniform_real_distribution<float>   dist_uni(0.0, 1.0);
+    const int n_angles = m_polar_image.cols;
 
 
-    // without motion: update Tsm only once
-    // if(!m_cfg.include_motion)
-    // {
-    //     // if(!updateTsm())
-    //     // {
-    //     //     std::cout << "Couldn't get Transform between sensor and map. Skipping..." << std::endl;
-    //     //     return msg;
-    //     // }
-    // }
-
-    if(m_resample)
+    if(m_resample || m_resample_every_frame)
     {
         m_waves_start = sample_cone_local(
             wave,
@@ -500,243 +580,281 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
         m_resample = false;
     }
 
-    rm::StopWatch sw_radar_sim;
-    sw_radar_sim();
 
     int n_phi = m_radar_model.phi.size;
 
-    // Thread-local storage for radar points
-    std::vector<std::vector<radarays_gazebo_plugins::RadarPoint>> thread_radar_points;
+    m_radar_points_gt.clear();
+
+    // All beams of one pass are traced with a single call. Tracing every beam
+    // on its own (one model, one result buffer and one call per beam) cost a
+    // full CPU core for work that takes a few milliseconds.
+    if(!m_sim)
     {
-        int max_threads = omp_get_max_threads();
-        thread_radar_points.resize(max_threads);
+        m_sim = std::make_shared<rm::OnDnSimulatorEmbree>(m_map);
+        m_sim->setTsb(rm::Transform::Identity());
     }
 
-    #pragma omp parallel for
-    for(size_t angle_id = 0; angle_id < n_angles; angle_id++)
+    // the polar image is only built when somebody listens to it
+    const bool make_image = m_image_requested;
+
+    struct Beam
     {
+        float ux, uy, uz;       // direction in the sensor frame
+        float radial_velocity;  // Doppler of a static world
+        float solid_angle;      // per ray
+    };
 
-        int tid = 0;
+    const size_t n_beams = static_cast<size_t>(n_angles) * n_phi;
+    const size_t n_start = std::max<size_t>(m_waves_start.size(), 1);
+    const float d_theta = fabs(m_radar_model.theta.inc);
+    const float d_phi = (n_phi > 1) ? fabs(m_radar_model.phi.inc) : d_theta;
+
+    std::vector<Beam> beams(n_beams);
+    std::vector<DirectedWave> waves;
+    std::vector<uint32_t> wave_beam;
+    waves.reserve(n_beams * n_start);
+    wave_beam.reserve(n_beams * n_start);
+
+    for(size_t angle_id = 0; angle_id < (size_t)n_angles; angle_id++)
+    {
+        const float theta = m_radar_model.getTheta(angle_id);
+        for(size_t phi_id = 0; phi_id < (size_t)n_phi; phi_id++)
         {
-            tid = omp_get_thread_num();
-        }
+            const float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
+            const uint32_t beam_id = angle_id * n_phi + phi_id;
 
-        auto sims_it = m_sims.find(tid);
-        if(m_sims.find(tid) == m_sims.end())
-        {
-            m_sims[tid] = std::make_shared<rm::OnDnSimulatorEmbree>(m_map);
-            sims_it = m_sims.find(tid);
-            auto Tsb = rm::Transform::Identity();
-            sims_it->second->setTsb(Tsb);
+            Beam& beam = beams[beam_id];
+            // positive phi pitches down
+            beam.ux = cos(phi_angle) * cos(theta);
+            beam.uy = cos(phi_angle) * sin(theta);
+            beam.uz = -sin(phi_angle);
+            beam.radial_velocity = -(m_sensor_velocity.x * beam.ux
+                + m_sensor_velocity.y * beam.uy + m_sensor_velocity.z * beam.uz);
+            beam.solid_angle = d_theta * d_phi * fabs(cos(phi_angle)) / static_cast<float>(n_start);
 
-            #pragma omp critical
-            std::cout << "Created new simulator for thread " << tid << std::endl;
-        }
-        auto sim = sims_it->second;
-
-        if(!sim)
-        {
-            std::cout << "ERROR!! Sim shared ptr empty" << std::endl;
-        }
-
-        // Collect all signals across phi for polar image (max-merge)
-        std::vector<Signal> signals_merged;
-
-        for(size_t phi_id = 0; phi_id < n_phi; phi_id++)
-        {
-            float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
-
-            std::vector<DirectedWave> waves = m_waves_start;
-
-            rm::OnDnModel model = make_model(waves);
-            sim->setModel(model);
-
-            rm::Transform Tas;
-            Tas.R = rm::EulerAngles{0.0, phi_angle, m_radar_model.getTheta(angle_id)};
-            Tas.t = m_radar_model.getOrigin(0, angle_id);
-
-            rm::Transform Tam = Tsm * Tas;
-
-            rm::Memory<rm::Transform> Tams(1);
-            Tams[0] = Tam;
-
-            std::vector<Signal> signals;
-            ///////
-            /// 1. Signal generation
-            for(size_t pass_id = 0; pass_id < m_params.model.n_reflections; pass_id++)
+            const rm::Quaternion R = rm::EulerAngles{0.0, phi_angle, theta};
+            for(const DirectedWave& w_start : m_waves_start)
             {
-                using ResT = rm::Bundle<
-                    rm::Hits<rm::RAM>,
-                    rm::Ranges<rm::RAM>,
-                    rm::Normals<rm::RAM>,
-                    rm::ObjectIds<rm::RAM>
-                >;
+                DirectedWave w = w_start;
+                w.ray.dir = R * w_start.ray.dir;
+                // start outside of the own vehicle, the skipped distance still counts
+                w.ray.orig = w.ray.dir * m_self_clearance;
+                w.time = m_self_clearance / w.velocity;
+                waves.push_back(w);
+                wave_beam.push_back(beam_id);
+            }
+        }
+    }
 
-                ResT results;
+    rm::Memory<rm::Transform> Tsms(1);
+    Tsms[0] = Tsm;
 
-                results.hits.resize(model.size());
-                results.ranges.resize(model.size());
-                results.normals.resize(model.size());
-                results.object_ids.resize(model.size());
+    m_returns.clear();
+    std::vector<std::vector<Signal> > signals_per_angle;
+    if(make_image)
+    {
+        signals_per_angle.resize(n_angles);
+    }
 
-                sim->simulate(Tams, results);
+    auto add_signal = [&](uint32_t beam_id, double time, double strength)
+    {
+        if(make_image)
+        {
+            signals_per_angle[beam_id / n_phi].push_back({time, strength});
+        }
 
-                std::vector<DirectedWave> waves_new;
+        // the wave travels 0.3 m/ns, there and back
+        const float signal_dist = 0.3 * time / 2.0;
+        if(std::isfinite(signal_dist) && std::isfinite(strength)
+            && signal_dist >= m_radar_model.range.min
+            && signal_dist <= m_radar_model.range.max
+            && strength > m_wave_energy_threshold)
+        {
+            const Beam& beam = beams[beam_id];
+            radarays_gazebo_plugins::RadarReturn ret;
+            ret.range = signal_dist;
+            ret.dx = beam.ux;
+            ret.dy = beam.uy;
+            ret.dz = beam.uz;
+            ret.power = strength;
+            ret.radial_velocity = beam.radial_velocity;
+            ret.solid_angle = beam.solid_angle;
+            m_returns.push_back(ret);
+        }
+    };
 
-                for(size_t i=0; i < waves.size(); i++)
+    using ResT = rm::Bundle<
+        rm::Hits<rm::RAM>,
+        rm::Ranges<rm::RAM>,
+        rm::Normals<rm::RAM>,
+        rm::ObjectIds<rm::RAM>
+    >;
+
+    for(size_t pass_id = 0; pass_id < (size_t)m_params.model.n_reflections && !waves.empty(); pass_id++)
+    {
+        rm::OnDnModel model = make_model(waves);
+        m_sim->setModel(model);
+
+        ResT results;
+        results.hits.resize(model.size());
+        results.ranges.resize(model.size());
+        results.normals.resize(model.size());
+        results.object_ids.resize(model.size());
+
+        m_sim->simulate(Tsms, results);
+
+        if(pass_id == 0)
+        {
+            // ground truth: first ray of every beam
+            for(size_t i = 0; i < waves.size(); i += n_start)
+            {
+                if(!results.hits[i])
                 {
-                    DirectedWave wave = waves[i];
-                    const float wave_range = results.ranges[i];
-                    const rmagine::Vector surface_normal = results.normals[i].normalize();
-                    const unsigned int obj_id = results.object_ids[i];
+                    continue;
+                }
+                const float range = results.ranges[i] + m_self_clearance;
+                if(range >= m_radar_model.range.min && range <= m_radar_model.range.max)
+                {
+                    const Beam& beam = beams[wave_beam[i]];
+                    radarays_gazebo_plugins::RadarPoint pt;
+                    pt.x = range * beam.ux;
+                    pt.y = range * beam.uy;
+                    pt.z = range * beam.uz;
+                    pt.intensity = 1.0;
+                    pt.velocity = 0.0f;
+                    m_radar_points_gt.push_back(pt);
+                }
+            }
+        }
 
-                    if(obj_id > 10000)
+        std::vector<DirectedWave> waves_new;
+        std::vector<uint32_t> wave_beam_new;
+        waves_new.reserve(waves.size() * 2);
+        wave_beam_new.reserve(waves.size() * 2);
+
+        for(size_t i=0; i < waves.size(); i++)
+        {
+            if(!results.hits[i])
+            {
+                continue;
+            }
+
+            const DirectedWave& wave = waves[i];
+            const uint32_t beam_id = wave_beam[i];
+            const float wave_range = results.ranges[i];
+            const rmagine::Vector surface_normal = results.normals[i].normalize();
+            const unsigned int obj_id = results.object_ids[i];
+
+            if(obj_id > 10000)
+            {
+                continue;
+            }
+
+            const DirectedWave incidence = wave.move(wave_range);
+
+            DirectedWave reflection = incidence;
+            DirectedWave refraction = incidence;
+
+            if(static_cast<int>(incidence.material_id) == m_material_id_air)
+            {
+                // models spawned after the material search are not in the table
+                refraction.material_id = (obj_id < m_object_materials.size())
+                    ? m_object_materials[obj_id] : 1;
+            } else {
+                refraction.material_id = m_material_id_air;
+            }
+
+            float v_refraction = 1.0;
+            if(incidence.material_id != refraction.material_id)
+            {
+                v_refraction = m_params.materials.data[refraction.material_id].velocity;
+            } else {
+                v_refraction = incidence.velocity;
+            }
+
+            auto res = fresnel(surface_normal, incidence, v_refraction);
+
+            reflection.ray.dir = res.first.ray.dir;
+            reflection.energy = res.first.energy;
+
+            if(reflection.energy > m_wave_energy_threshold)
+            {
+                waves_new.push_back(reflection);
+                wave_beam_new.push_back(beam_id);
+
+                if(static_cast<int>(reflection.material_id) == m_material_id_air)
+                {
+                    auto material = m_params.materials.data[refraction.material_id];
+
+                    double incidence_angle = get_incidence_angle(surface_normal, incidence);
+                    double return_energy_path = back_reflection_shader(
+                        incidence_angle,
+                        reflection.energy,
+                        material.ambient,
+                        material.diffuse,
+                        material.specular
+                    );
+
+                    // signal travelling back along the path it came
+                    if(pass_id == 0 || m_cfg.record_multi_reflection)
                     {
-                        continue;
+                        add_signal(beam_id, incidence.time * 2.0, return_energy_path);
                     }
 
-                    const DirectedWave incidence = wave.move(wave_range);
-
-                    DirectedWave reflection = incidence;
-                    DirectedWave refraction = incidence;
-
-                    if(incidence.material_id == m_material_id_air)
+                    // signal travelling straight back to the sensor
+                    if(pass_id > 0 && m_cfg.record_multi_path)
                     {
-                        refraction.material_id = m_object_materials[obj_id];
-                    } else {
-                        refraction.material_id = m_material_id_air;
-                    }
+                        rm::Vector dir_sensor_to_hit = reflection.ray.orig;
+                        const double distance_between_sensor_and_hit = dir_sensor_to_hit.l2norm();
+                        dir_sensor_to_hit.normalizeInplace();
+                        const double time_to_sensor = distance_between_sensor_and_hit / reflection.velocity;
 
-                    float v_refraction = 1.0;
+                        double sensor_view_scalar = wave.ray.dir.dot(dir_sensor_to_hit);
 
-                    if(incidence.material_id != refraction.material_id)
-                    {
-                        v_refraction = m_params.materials.data[refraction.material_id].velocity;
-                    } else {
-                        v_refraction = incidence.velocity;
-                    }
+                        double angle_between_reflection_and_sensor_dir
+                            = angle_between(-reflection.ray.dir, dir_sensor_to_hit);
 
-                    auto res = fresnel(surface_normal, incidence, v_refraction);
-
-                    reflection.ray.dir = res.first.ray.dir;
-                    reflection.energy = res.first.energy;
-
-                    if(reflection.energy > m_wave_energy_threshold)
-                    {
-                        waves_new.push_back(reflection);
-
-                        if(reflection.material_id == m_material_id_air)
+                        if(sensor_view_scalar > m_cfg.multipath_threshold)
                         {
-                            auto material = m_params.materials.data[refraction.material_id];
-
-                            double incidence_angle = get_incidence_angle(surface_normal, incidence);
-                            double return_energy_path = back_reflection_shader(
-                                incidence_angle,
+                            double return_energy_air = back_reflection_shader(
+                                angle_between_reflection_and_sensor_dir,
                                 reflection.energy,
                                 material.ambient,
                                 material.diffuse,
                                 material.specular
                             );
-
-                            if(pass_id == 0 || m_cfg.record_multi_reflection)
-                            {
-                                float time_back = incidence.time * 2.0;
-                                signals.push_back({time_back, return_energy_path});
-                            }
-
-                            if(pass_id > 0 && m_cfg.record_multi_path)
-                            {
-                                Signal signal_air;
-
-                                rm::Vector dir_sensor_to_hit = reflection.ray.orig;
-                                const double distance_between_sensor_and_hit = dir_sensor_to_hit.l2norm();
-                                dir_sensor_to_hit.normalizeInplace();
-                                const double time_to_sensor = distance_between_sensor_and_hit / reflection.velocity;
-
-                                double sensor_view_scalar = wave.ray.dir.dot(dir_sensor_to_hit);
-
-                                double angle_between_reflection_and_sensor_dir
-                                    = angle_between(-reflection.ray.dir, dir_sensor_to_hit);
-
-                                if(m_cfg.record_multi_path
-                                    && sensor_view_scalar > m_cfg.multipath_threshold)
-                                {
-                                    double return_energy_air = back_reflection_shader(
-                                        angle_between_reflection_and_sensor_dir,
-                                        reflection.energy,
-                                        material.ambient,
-                                        material.diffuse,
-                                        material.specular
-                                    );
-
-                                    signal_air.time = incidence.time + time_to_sensor;
-                                    signal_air.strength = return_energy_air;
-
-                                    signals.push_back(signal_air);
-                                }
-                            }
+                            add_signal(beam_id, incidence.time + time_to_sensor, return_energy_air);
                         }
                     }
-
-                    refraction.ray.dir = res.second.ray.dir;
-                    refraction.energy = res.second.energy;
-
-                    if(refraction.energy > m_wave_energy_threshold)
-                    {
-                        waves_new.push_back(refraction);
-                    }
-                }
-
-                float skip_dist = 0.001;
-                for(size_t i=0; i<waves_new.size(); i++)
-                {
-                    waves_new[i].moveInplace(skip_dist);
-                }
-
-                waves = waves_new;
-
-                if(pass_id < m_params.model.n_reflections - 1)
-                {
-                    model = make_model(waves);
-                    sim->setModel(model);
                 }
             }
 
-            // Generate 3D radar points from signals for this (theta, phi) combination
-            float theta = m_radar_model.getTheta(angle_id);
-            for(size_t i=0; i<signals.size(); i++)
+            refraction.ray.dir = res.second.ray.dir;
+            refraction.energy = res.second.energy;
+
+            if(refraction.energy > m_wave_energy_threshold)
             {
-                auto signal = signals[i];
-                float half_time = signal.time / 2.0;
-                float signal_dist = 0.3 * half_time;
-
-                if(signal_dist >= m_radar_model.range.min && signal_dist <= m_radar_model.range.max
-                   && signal.strength > m_wave_energy_threshold)
-                {
-                    float cos_phi = cos(phi_angle);
-                    float sin_phi = sin(phi_angle);
-                    float cos_theta = cos(theta);
-                    float sin_theta = sin(theta);
-
-                    radarays_gazebo_plugins::RadarPoint pt;
-                    pt.x = signal_dist * cos_phi * cos_theta;
-                    pt.y = signal_dist * cos_phi * sin_theta;
-                    pt.z = -signal_dist * sin_phi;
-                    pt.intensity = static_cast<float>(signal.strength);
-                    thread_radar_points[tid].push_back(pt);
-                }
+                waves_new.push_back(refraction);
+                wave_beam_new.push_back(beam_id);
             }
+        }
 
-            // Merge signals into polar image signals (max-merge across all phi)
-            for(auto& sig : signals)
-            {
-                signals_merged.push_back(sig);
-            }
+        // step off the surface so the next pass does not hit it again
+        const float skip_dist = 0.001;
+        for(size_t i=0; i<waves_new.size(); i++)
+        {
+            waves_new[i].moveInplace(skip_dist);
+        }
 
-        } // end phi loop
+        waves.swap(waves_new);
+        wave_beam.swap(wave_beam_new);
+    }
 
-        //////////////////
-        /// 2. Signals -> Canvas (max-merge all phi signals for this theta)
+    // Signals -> polar image, one column per azimuth
+    for(size_t angle_id = 0; make_image && angle_id < (size_t)n_angles; angle_id++)
+    {
+        const std::vector<Signal>& signals_merged = signals_per_angle[angle_id];
+
         cv::Mat_<float> slice(m_polar_image.rows, 1, 0.0);
 
         float max_val = 0.0;
@@ -751,7 +869,7 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             {
                 if(m_cfg.signal_denoising > 0)
                 {
-                    for(int vid = 0; vid < denoising_weights.size(); vid++)
+                    for(int vid = 0; vid < static_cast<int>(denoising_weights.size()); vid++)
                     {
                         int glob_id = vid + cell - denoising_mode;
                         if(glob_id > 0 && glob_id < slice.rows)
@@ -793,16 +911,14 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             double scale_high = m_cfg.ambient_noise_perlin_scale_high;
             double p_low = m_cfg.ambient_noise_perlin_p_low;
 
-            for(size_t i=0; i<slice.rows; i++)
+            for(int i=0; i<slice.rows; i++)
             {
                 float signal = slice.at<float>(i);
 
-                double p;
-
-                if(m_cfg.ambient_noise == 1)
-                {
-                    p = dist_uni(gen);
-                } else if(m_cfg.ambient_noise == 2)
+                // 1 = uniform, 2 = Perlin. Unknown values fall back to uniform
+                // instead of reading an uninitialized value.
+                double p = dist_uni(gen);
+                if(m_cfg.ambient_noise == 2)
                 {
                     p = perlin_noise_hilo(random_begin, random_begin,
                             static_cast<double>(col), static_cast<double>(i),
@@ -838,21 +954,40 @@ void RadaRaysEmbree::simulate(rm::Transform Tsm)
             }
         }
 
-        slice *= m_cfg.signal_max / max_val;
+        // columns without any return stay black instead of dividing by zero
+        slice *= (max_val > 0.0f) ? m_cfg.signal_max / max_val : 0.0f;
         slice.convertTo(m_polar_image.col(col), CV_8UC1);
     }
 
-    // Merge thread-local radar points
-    m_radar_points.clear();
-    for(auto& pts : thread_radar_points)
+    // Detection: sparse point cloud like the real device
+    if(m_detector.params.enabled > 0.5)
     {
-        m_radar_points.insert(m_radar_points.end(), pts.begin(), pts.end());
+        radarays_gazebo_plugins::RadarSensorPose sensor_pose;
+        sensor_pose.x = Tsm.t.x;
+        sensor_pose.y = Tsm.t.y;
+        sensor_pose.z = Tsm.t.z;
+        sensor_pose.qx = Tsm.R.x;
+        sensor_pose.qy = Tsm.R.y;
+        sensor_pose.qz = Tsm.R.z;
+        sensor_pose.qw = Tsm.R.w;
+        m_radar_points = m_detector.process(m_returns, sensor_pose);
+    } else {
+        // raw ray hits, for debugging the ray tracing
+        m_radar_points.clear();
+        m_radar_points.reserve(m_returns.size());
+        for(const auto& ret : m_returns)
+        {
+            radarays_gazebo_plugins::RadarPoint pt;
+            pt.x = ret.range * ret.dx;
+            pt.y = ret.range * ret.dy;
+            pt.z = ret.range * ret.dz;
+            pt.intensity = ret.power;
+            pt.velocity = ret.radial_velocity;
+            m_radar_points.push_back(pt);
+        }
     }
 
-    double el_radar_sim = sw_radar_sim();
 
-    // std::cout << "SIM in " << el_radar_sim << "s" << std::endl;
-    // std::cout << std::fixed << std::setprecision(8) << el_radar_sim << std::endl;
 }
 
 bool RadaRaysEmbree::UpdateImpl(const bool _force)
@@ -873,25 +1008,33 @@ bool RadaRaysEmbree::UpdateImpl(const bool _force)
 
         if(!m_materials_searched)
         {
-            std::cout << "Search for materials!!" << std::endl;
+            gzdbg << "Search for materials!!" << std::endl;
             searchForMaterials();
             m_materials_searched = true;
         }
     }
 
-    // std::cout << "RADARAYS UPDATE" << std::endl;
     auto pose = this->parentEntity->WorldPose();
+    auto linear_vel = this->parentEntity->WorldLinearVel();
     rm::Transform Tbm = to_rm(pose);
     rm::Transform Tsm = Tbm * m_Tsb;
 
-    // std::cout << "World Pose of sensor: " << Tsm << std::endl;
+    // Doppler needs the sensor velocity expressed in the sensor frame
+    const rm::Vector vel_world = {(float)linear_vel.X(), (float)linear_vel.Y(), (float)linear_vel.Z()};
+    const rm::Vector vel_sensor = Tsm.R.inv() * vel_world;
+    m_sensor_velocity = {vel_sensor.x, vel_sensor.y, vel_sensor.z};
+
     if(m_map_mutex)
     {
         m_map_mutex->lock_shared();
     }
 
     // fill global simulation buffer
-    simulate(Tsm);
+    {
+        // parameters may change from the ROS thread
+        std::lock_guard<std::mutex> cfg_lock(m_cfg_mutex);
+        simulate(Tsm);
+    }
 
     if(m_map_mutex)
     {
@@ -908,11 +1051,6 @@ void RadaRaysEmbree::updateDynCfg(
 {
     RCLCPP_INFO(m_nh_p->get_logger(), "RadaRaysEmbree - Changing Model");
     
-    // z_offset
-    // auto T = rm::Transform::Identity();
-    // T.t.z = config.z_offset;
-    // sim->setTsb(T);
-
     if(   config.beam_sample_dist != m_cfg.beam_sample_dist 
         || abs(config.beam_width - m_cfg.beam_width ) > 0.001
         || config.n_samples != m_cfg.n_samples

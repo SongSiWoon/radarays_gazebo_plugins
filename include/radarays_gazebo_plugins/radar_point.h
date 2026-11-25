@@ -10,6 +10,7 @@ struct RadarPoint
     float y;
     float z;
     float intensity;
+    float velocity;  // radial velocity (Doppler), m/s
 };
 
 } // namespace radarays_gazebo_plugins

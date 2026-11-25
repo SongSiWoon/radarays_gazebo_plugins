@@ -20,7 +20,7 @@
 #include <radarays_ros/image_algorithms.cuh>
 
 #include <cv_bridge/cv_bridge.h>
-#include <omp.h>
+#include <random>
 
 #include <rmagine/util/StopWatch.hpp>
 #include <rmagine/util/prints.h>
@@ -29,13 +29,11 @@ using namespace radarays_ros;
 namespace rm = rmagine;
 
 
-
 namespace gazebo
 {
 
 namespace sensors
 {
-
 
 
 static rm::Transform to_rm(const ignition::math::Pose3d& pose)
@@ -52,6 +50,22 @@ static rm::Transform to_rm(const ignition::math::Pose3d& pose)
 }
 
 
+// names of the radar model parameters (everything except "det.*")
+static const std::vector<std::string> RADAR_PARAM_NAMES = {
+    "n_cells", "resolution", "scroll_image", "range_min", "range_max",
+    "beam_width", "n_samples", "n_reflections", "beam_sample_dist",
+    "beam_sample_dist_normal_p_in_cone", "signal_denoising",
+    "signal_denoising_triangular_width", "signal_denoising_triangular_mode",
+    "signal_denoising_gaussian_width", "signal_denoising_gaussian_mode",
+    "signal_denoising_mb_width", "signal_denoising_mb_mode", "signal_max",
+    "ambient_noise", "ambient_noise_energy_max", "ambient_noise_energy_min",
+    "ambient_noise_energy_loss", "ambient_noise_at_signal_0",
+    "ambient_noise_at_signal_1", "ambient_noise_perlin_scale_low",
+    "ambient_noise_perlin_scale_high", "ambient_noise_perlin_p_low",
+    "record_multi_reflection", "record_multi_path", "multipath_threshold",
+    "include_motion", "resample_every_frame"
+};
+
 RadaRaysOptix::RadaRaysOptix()
 :Base() // if sensor is base class: Base(sensors::RAY)
 {
@@ -63,8 +77,51 @@ RadaRaysOptix::~RadaRaysOptix()
     gzdbg << "[RadaRaysOptix] Destroyed." << std::endl;
 }
 
+void RadaRaysOptix::loadDetectorSDF()
+{
+    // default reflection of surfaces without <radarays_material>:
+    // weak angle independent scattering plus a lobe around the surface normal
+    m_default_material.velocity = 0.0;  // opaque
+    m_default_material.ambient  = 0.1;
+    m_default_material.diffuse  = 1.0;
+    m_default_material.specular = 20.0;
+
+    if(this->sdf->HasElement("default_material"))
+    {
+        sdf::ElementPtr mat = this->sdf->GetElement("default_material");
+        if(mat->HasElement("velocity")) m_default_material.velocity = mat->Get<float>("velocity");
+        if(mat->HasElement("ambient"))  m_default_material.ambient = mat->Get<float>("ambient");
+        if(mat->HasElement("diffuse"))  m_default_material.diffuse = mat->Get<float>("diffuse");
+        if(mat->HasElement("specular")) m_default_material.specular = mat->Get<float>("specular");
+    }
+
+    // ray tracing effort, defaults of the ROS parameters with the same names
+    if(this->sdf->HasElement("ray_tracing"))
+    {
+        sdf::ElementPtr rt = this->sdf->GetElement("ray_tracing");
+        if(rt->HasElement("n_samples"))     m_sdf_n_samples = rt->Get<int>("n_samples");
+        if(rt->HasElement("n_reflections")) m_sdf_n_reflections = rt->Get<int>("n_reflections");
+        if(rt->HasElement("beam_width"))    m_sdf_beam_width = rt->Get<double>("beam_width");
+        if(rt->HasElement("self_clearance")) m_self_clearance = rt->Get<double>("self_clearance");
+    }
+
+    if(this->sdf->HasElement("radar_detector"))
+    {
+        sdf::ElementPtr det = this->sdf->GetElement("radar_detector");
+        for(auto& elem : m_detector.params.fields())
+        {
+            if(det->HasElement(elem.first))
+            {
+                *elem.second = det->Get<double>(elem.first);
+            }
+        }
+    }
+}
+
 void RadaRaysOptix::loadParamsSDF()
 {
+    loadDetectorSDF();
+
     if (!this->sdf->HasElement("ray")) {
         return;
     }
@@ -75,16 +132,15 @@ void RadaRaysOptix::loadParamsSDF()
         if (scanElem->HasElement("horizontal")) {
             auto h = scanElem->GetElement("horizontal");
             m_radar_model.theta.size = h->Get<int>("samples");
-            // theta.inc and theta.min define the full-circle radar sweep
-            // keep the default inc = -(2*PI)/size, don't use SDF increment
-            m_radar_model.theta.inc = -(2.0 * M_PI) / m_radar_model.theta.size;
+            m_radar_model.theta.min = h->Get<float>("min_angle");
+            m_radar_model.theta.inc = h->Get<float>("increment");
         }
         if (scanElem->HasElement("vertical")) {
             auto v = scanElem->GetElement("vertical");
             m_radar_model.phi.min = v->Get<float>("min_angle");
             m_radar_model.phi.inc = v->Get<float>("increment");
             m_radar_model.phi.size = v->Get<int>("samples");
-            std::cout << "[RadaRaysOptix] Loaded vertical scan: phi.min="
+            gzdbg << "[RadaRaysOptix] Loaded vertical scan: phi.min="
                 << m_radar_model.phi.min << " phi.inc=" << m_radar_model.phi.inc
                 << " phi.size=" << m_radar_model.phi.size << std::endl;
         }
@@ -122,16 +178,11 @@ void RadaRaysOptix::loadParams()
         material_air.diffuse  = 0.0;
         material_air.specular = 1.0;
         m_params.materials.data[0] = material_air;
-        radarays_ros::msg::RadarMaterial material_wall_stone;
-        material_wall_stone.velocity = 0.0;
-        material_wall_stone.ambient  = 1.0;
-        material_wall_stone.diffuse  = 0.0;
-        material_wall_stone.specular = 3000.0;
-        m_params.materials.data[1] = material_wall_stone;
+        m_params.materials.data[1] = m_default_material;
     }
 
-    // not allowed to place more than 100 objects.
-    // TODO: make this more dynamic
+    // placeholder until the map is available: searchForMaterials() sizes the
+    // table to the map and is called again whenever geometries come or go
     size_t n_default_objects = 100;
 
     m_object_materials.resize(n_default_objects);
@@ -143,26 +194,10 @@ void RadaRaysOptix::loadParams()
     // find real materials
     m_polar_image = cv::Mat_<unsigned char>(0, m_radar_model.theta.size);
     
-    // TODO: load radar params from URDF
-    // currently only via rqt_reconfigure
+    // sensor geometry, ray tracing settings and detection model from the SDF
     loadParamsSDF();
     
-    // TODO:
-    // this is how it was in a static environment:
-    // 
-    // m_params.materials = loadRadarMaterialsFromParameterServer(m_nh_p);
-    // m_nh_p->getParam("object_materials", m_object_materials);
-    // m_nh_p->getParam("material_id_air", m_material_id_air);
-    // 
-    // But Gazebo environments are changing. Maybe we can fetch custom 
-    // materials from Gazebo? 
-    // - A first quick solution would be to pass a list of materials
-    //   as before and does not allow to change the world (at own risk)
-    // 
-    // Or maybe: For each object spawn something is added to 
-    //   dynamic reconfigure?
 
-    // TODO: load additional params from gazebo - xml (instead of ros paremeters)
 }
 
 void RadaRaysOptix::uploadBuffers()
@@ -184,124 +219,118 @@ void RadaRaysOptix::uploadBuffers()
 
 void RadaRaysOptix::searchForMaterials()
 {
-    // TODO:
-    // This is done only once.
-    // This has to everytime the map was updated
-    // Or better:
-    // - for every added or removed object
-    // - only search for materials of the added object
+    // Called with the map locked, whenever the set of map geometries changed.
+    //
+    // material 0: air
+    // material 1: default for every geometry without <radarays_material>
+    m_params.materials.data.resize(2);
+    {
+        radarays_ros::msg::RadarMaterial material_air;
+        material_air.velocity = 0.3; // m/ns
+        material_air.ambient  = 1.0;
+        material_air.diffuse  = 0.0;
+        material_air.specular = 1.0;
+        m_params.materials.data[0] = material_air;
+        m_params.materials.data[1] = m_default_material;
+    }
 
-    m_object_materials.resize(0);
-    m_params.materials.data.resize(1);
-    radarays_ros::msg::RadarMaterial material_air;
-    material_air.velocity = 0.3; // m/ns
-    material_air.ambient  = 1.0;
-    material_air.diffuse  = 0.0;
-    material_air.specular = 1.0;
-    m_params.materials.data[0] = material_air;
+    // 1. materials given in the world SDF, by "model::link::visual"
+    std::unordered_map<std::string, radarays_ros::msg::RadarMaterial> sdf_materials;
 
     sdf::ElementPtr world_sdf = this->world->SDF();
-    sdf::ElementPtr model_sdf = world_sdf->GetElement("model");
-
-    for(sdf::ElementPtr model_sdf = world_sdf->GetElement("model");
-        model_sdf;
-        model_sdf = model_sdf->GetNextElement("model"))
+    if(world_sdf && world_sdf->HasElement("model"))
     {
-        std::string model_name = model_sdf->GetAttribute("name")->GetAsString();
-
-        for(sdf::ElementPtr link_sdf = model_sdf->GetElement("link");
-            link_sdf;
-            link_sdf = link_sdf->GetNextElement("link"))
+        for(sdf::ElementPtr model_sdf = world_sdf->GetElement("model");
+            model_sdf;
+            model_sdf = model_sdf->GetNextElement("model"))
         {
-            std::string link_name = link_sdf->GetAttribute("name")->GetAsString();
-            
-            for(sdf::ElementPtr vis_sdf = link_sdf->GetElement("visual");
-                vis_sdf;
-                vis_sdf = vis_sdf->GetNextElement("visual"))
+            if(!model_sdf->HasElement("link"))
             {
-                std::string vis_name = vis_sdf->GetAttribute("name")->GetAsString();
-                
-                sdf::ElementPtr mat_sdf = vis_sdf->GetElement("radarays_material");
+                continue;
+            }
+            const std::string model_name = model_sdf->GetAttribute("name")->GetAsString();
 
-                radarays_ros::msg::RadarMaterial material;
-                
-                if(mat_sdf)
+            for(sdf::ElementPtr link_sdf = model_sdf->GetElement("link");
+                link_sdf;
+                link_sdf = link_sdf->GetNextElement("link"))
+            {
+                if(!link_sdf->HasElement("visual"))
                 {
-                    std::cout << "Found RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
-                    material.velocity = mat_sdf->Get<float>("velocity");
-                    material.ambient = mat_sdf->Get<float>("ambient");
-                    material.diffuse = mat_sdf->Get<float>("diffuse");
-                    material.specular = mat_sdf->Get<float>("specular");
-                } else {
-                    // wall stone? defaults
-                    std::cout << "Missing RadaRays material in: " << model_name << "/" << link_name << "/" << vis_name << std::endl;
-                    std::cout << "-- Setting RadaRays materials to defaults" << std::endl;
-                    material.velocity = 0.0;
-                    material.ambient  = 1.0;
-                    material.diffuse  = 0.0;
-                    material.specular = 3000.0;
-                }
-                    
-                // figure out id in map
-                std::string name = model_name + "::" + link_name + "::" + vis_name;
-
-                // find model in optix_map
-                if(m_map_mutex)
-                {
-                    m_map_mutex->lock_shared();
-                }
-
-                int obj_id = -1;
-                if(m_map)
-                {
-                    std::cout << "SEARCH FOR: " << name << std::endl;
-                    for(auto elem : m_map->scene()->geometries())
-                    {
-                        std::cout << elem.first << ".: " << elem.second->name << std::endl;
-                        if(elem.second->name == name)
-                        {
-                            std::cout << "FOUND OBJ ID: " << elem.first << std::endl;
-                            obj_id = elem.first;
-                            break;
-                        }
-                    }
-                } else {
-                    std::cout << "ERROR: no optix map" << std::endl;
                     continue;
                 }
+                const std::string link_name = link_sdf->GetAttribute("name")->GetAsString();
 
-                if(m_map_mutex)
+                for(sdf::ElementPtr vis_sdf = link_sdf->GetElement("visual");
+                    vis_sdf;
+                    vis_sdf = vis_sdf->GetNextElement("visual"))
                 {
-                    m_map_mutex->unlock_shared();
-                }
-                
-                if(obj_id >= 0)
-                {
-                    std::cout << "FOUND MODEL: " << name << std::endl;
-                    std::cout << " -> optix map geometry id: " << obj_id << std::endl;
-
-                    m_params.materials.data.push_back(material);
-                    size_t mat_id = m_params.materials.data.size() - 1;
-
-                    // fill with unknown with air materials
-                    while(m_object_materials.size() <= obj_id)
+                    if(!vis_sdf->HasElement("radarays_material"))
                     {
-                        m_object_materials.push_back(0);
+                        continue;
                     }
-                    // object -> material
-                    m_object_materials[obj_id] = mat_id;
-                } else {
-                    std::cout << "COULD NOT FIND GEOMETRY IN OptixMap!" << std::endl;
+                    const std::string vis_name = vis_sdf->GetAttribute("name")->GetAsString();
+                    sdf::ElementPtr mat_sdf = vis_sdf->GetElement("radarays_material");
+
+                    radarays_ros::msg::RadarMaterial material = m_default_material;
+                    if(mat_sdf->HasElement("velocity")) material.velocity = mat_sdf->Get<float>("velocity");
+                    if(mat_sdf->HasElement("ambient"))  material.ambient = mat_sdf->Get<float>("ambient");
+                    if(mat_sdf->HasElement("diffuse"))  material.diffuse = mat_sdf->Get<float>("diffuse");
+                    if(mat_sdf->HasElement("specular")) material.specular = mat_sdf->Get<float>("specular");
+
+                    sdf_materials[model_name + "::" + link_name + "::" + vis_name] = material;
                 }
             }
         }
-        
-        // TODO:
-        // full_name = model/link/...
-        // put full name to optix map elements and compare instead
-        // thus, we can apply materials to model parts
-        // TODO: Check if previous TODO is done already.
     }
+
+    // 2. every geometry of the map gets a material. Geometries of models
+    // that are not part of the world file (spawned later) use the default,
+    // so the GPU never indexes outside of the table.
+    m_object_materials.assign(1, 1);
+    m_object_links.clear();
+    size_t n_custom = 0;
+
+    if(m_map)
+    {
+        for(const auto& elem : m_map->scene()->geometries())
+        {
+            const unsigned int obj_id = elem.first;
+            // links of non static models move: remembered for the Doppler of their returns
+            {
+                const std::string& geom_name = elem.second->name;
+                const size_t last_sep = geom_name.rfind("::");
+                if(last_sep != std::string::npos)
+                {
+                    physics::LinkPtr link = boost::dynamic_pointer_cast<physics::Link>(
+                        this->world->EntityByName(geom_name.substr(0, last_sep)));
+                    if(link && !link->IsStatic())
+                    {
+                        if(m_object_links.size() <= obj_id)
+                        {
+                            m_object_links.resize(obj_id + 1);
+                        }
+                        m_object_links[obj_id] = link;
+                    }
+                }
+            }
+
+            if(m_object_materials.size() <= obj_id)
+            {
+                m_object_materials.resize(obj_id + 1, 1);
+            }
+
+            auto mat_it = sdf_materials.find(elem.second->name);
+            if(mat_it != sdf_materials.end())
+            {
+                m_params.materials.data.push_back(mat_it->second);
+                m_object_materials[obj_id] = m_params.materials.data.size() - 1;
+                n_custom++;
+            }
+        }
+    }
+
+    gzmsg << "[RadaRaysOptix] Materials updated: " << m_object_materials.size()
+          << " map objects, " << n_custom << " with <radarays_material>" << std::endl;
 
     uploadBuffers();
 }
@@ -310,19 +339,34 @@ void RadaRaysOptix::Init()
 {
     Base::Init();
 
-    m_nh_p = gazebo_ros::Node::Get(this->sdf);
+    // The parameter node lives in the namespace of the robot (the ROS plugin
+    // of this sensor carries it), so several drones do not share "/radar".
+    sdf::ElementPtr node_sdf = this->sdf;
+    if(this->sdf->HasElement("plugin"))
+    {
+        sdf::ElementPtr plugin_sdf = this->sdf->GetElement("plugin");
+        if(plugin_sdf->HasElement("ros"))
+        {
+            node_sdf = plugin_sdf;
+        }
+    }
+    m_nh_p = gazebo_ros::Node::Get(node_sdf, "radar");
 
     loadParams();
 
-    // Declare ROS2 parameters (radar model config)
-    m_nh_p->declare_parameter("n_cells", 200);
-    m_nh_p->declare_parameter("resolution", 0.1);
+    // Declare ROS2 parameters (radar model config).
+    // Sensor geometry defaults come from the SDF, so the SDF stays the
+    // single place that describes the device.
+    const double default_resolution = m_detector.params.range_resolution;
+    m_nh_p->declare_parameter("n_cells",
+        static_cast<int>(std::ceil(m_radar_model.range.max / default_resolution)));
+    m_nh_p->declare_parameter("resolution", default_resolution);
     m_nh_p->declare_parameter("scroll_image", 0);
-    m_nh_p->declare_parameter("range_min", 0.2);
-    m_nh_p->declare_parameter("range_max", 100.0);
-    m_nh_p->declare_parameter("beam_width", 3.0);
-    m_nh_p->declare_parameter("n_samples", 10);
-    m_nh_p->declare_parameter("n_reflections", 1);
+    m_nh_p->declare_parameter("range_min", static_cast<double>(m_radar_model.range.min));
+    m_nh_p->declare_parameter("range_max", static_cast<double>(m_radar_model.range.max));
+    m_nh_p->declare_parameter("beam_width", m_sdf_beam_width);
+    m_nh_p->declare_parameter("n_samples", m_sdf_n_samples);
+    m_nh_p->declare_parameter("n_reflections", m_sdf_n_reflections);
     m_nh_p->declare_parameter("beam_sample_dist", 0);
     m_nh_p->declare_parameter("beam_sample_dist_normal_p_in_cone", 1.0);
     m_nh_p->declare_parameter("signal_denoising", 0);
@@ -342,14 +386,34 @@ void RadaRaysOptix::Init()
     m_nh_p->declare_parameter("ambient_noise_perlin_scale_low", 0.01);
     m_nh_p->declare_parameter("ambient_noise_perlin_scale_high", 0.1);
     m_nh_p->declare_parameter("ambient_noise_perlin_p_low", 0.5);
-    m_nh_p->declare_parameter("record_multi_reflection", false);
+    m_nh_p->declare_parameter("record_multi_reflection", true);
     m_nh_p->declare_parameter("record_multi_path", false);
     m_nh_p->declare_parameter("multipath_threshold", 0.9);
     m_nh_p->declare_parameter("include_motion", false);
+    m_nh_p->declare_parameter("resample_every_frame", false);
 
-    // Apply initial config from parameters
-    radarays_ros::RadarModelConfig initial_cfg;
-    updateDynCfg(initial_cfg, 0);
+    // Detection model: SDF values are the defaults, tunable at runtime
+    for(auto& elem : m_detector.params.fields())
+    {
+        m_nh_p->declare_parameter("det." + elem.first, *elem.second);
+    }
+
+    // Apply every declared parameter, not only a subset: what
+    // "ros2 param get" reports is what the simulation uses.
+    {
+        std::lock_guard<std::mutex> lock(m_cfg_mutex);
+
+        radarays_ros::RadarModelConfig initial_cfg;
+        for(const std::string& name : RADAR_PARAM_NAMES)
+        {
+            applyParam(m_nh_p->get_parameter(name), initial_cfg);
+        }
+        for(auto& elem : m_detector.params.fields())
+        {
+            applyParam(m_nh_p->get_parameter("det." + elem.first), initial_cfg);
+        }
+        updateDynCfg(initial_cfg, 0);
+    }
 
     // Register parameter change callback
     m_param_callback = m_nh_p->add_on_set_parameters_callback(
@@ -361,58 +425,104 @@ void RadaRaysOptix::Init()
     }
 }
 
+void RadaRaysOptix::applyParam(
+    const rclcpp::Parameter& param,
+    radarays_ros::RadarModelConfig& cfg)
+{
+    const std::string& name = param.get_name();
+
+    if(name.rfind("det.", 0) == 0)
+    {
+        const std::string field = name.substr(4);
+        for(auto& elem : m_detector.params.fields())
+        {
+            if(elem.first == field)
+            {
+                *elem.second = param.as_double();
+            }
+        }
+        return;
+    }
+
+    if(name == "n_cells")                              cfg.n_cells = param.as_int();
+    else if(name == "resolution")                     cfg.resolution = param.as_double();
+    else if(name == "scroll_image")                   cfg.scroll_image = param.as_int();
+    else if(name == "range_min")                      cfg.range_min = param.as_double();
+    else if(name == "range_max")                      cfg.range_max = param.as_double();
+    else if(name == "beam_width")                     cfg.beam_width = param.as_double();
+    else if(name == "n_samples")                      cfg.n_samples = param.as_int();
+    else if(name == "n_reflections")                  cfg.n_reflections = param.as_int();
+    else if(name == "beam_sample_dist")               cfg.beam_sample_dist = param.as_int();
+    else if(name == "beam_sample_dist_normal_p_in_cone") cfg.beam_sample_dist_normal_p_in_cone = param.as_double();
+    else if(name == "signal_denoising")               cfg.signal_denoising = param.as_int();
+    else if(name == "signal_denoising_triangular_width") cfg.signal_denoising_triangular_width = param.as_int();
+    else if(name == "signal_denoising_triangular_mode")  cfg.signal_denoising_triangular_mode = param.as_int();
+    else if(name == "signal_denoising_gaussian_width")   cfg.signal_denoising_gaussian_width = param.as_int();
+    else if(name == "signal_denoising_gaussian_mode")    cfg.signal_denoising_gaussian_mode = param.as_int();
+    else if(name == "signal_denoising_mb_width")         cfg.signal_denoising_mb_width = param.as_int();
+    else if(name == "signal_denoising_mb_mode")          cfg.signal_denoising_mb_mode = param.as_int();
+    else if(name == "signal_max")                     cfg.signal_max = param.as_double();
+    else if(name == "ambient_noise")                  cfg.ambient_noise = param.as_int();
+    else if(name == "ambient_noise_energy_max")       cfg.ambient_noise_energy_max = param.as_double();
+    else if(name == "ambient_noise_energy_min")       cfg.ambient_noise_energy_min = param.as_double();
+    else if(name == "ambient_noise_energy_loss")      cfg.ambient_noise_energy_loss = param.as_double();
+    else if(name == "ambient_noise_at_signal_0")      cfg.ambient_noise_at_signal_0 = param.as_double();
+    else if(name == "ambient_noise_at_signal_1")      cfg.ambient_noise_at_signal_1 = param.as_double();
+    else if(name == "ambient_noise_perlin_scale_low") cfg.ambient_noise_perlin_scale_low = param.as_double();
+    else if(name == "ambient_noise_perlin_scale_high") cfg.ambient_noise_perlin_scale_high = param.as_double();
+    else if(name == "ambient_noise_perlin_p_low")     cfg.ambient_noise_perlin_p_low = param.as_double();
+    else if(name == "record_multi_reflection")        cfg.record_multi_reflection = param.as_bool();
+    else if(name == "record_multi_path")              cfg.record_multi_path = param.as_bool();
+    else if(name == "multipath_threshold")            cfg.multipath_threshold = param.as_double();
+    else if(name == "include_motion")                 cfg.include_motion = param.as_bool();
+    else if(name == "resample_every_frame")           m_resample_every_frame = param.as_bool();
+}
+
 rcl_interfaces::msg::SetParametersResult RadaRaysOptix::onParameterChange(
     const std::vector<rclcpp::Parameter>& params)
 {
-    radarays_ros::RadarModelConfig cfg = m_cfg;
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
 
     for(const auto& param : params)
     {
         const std::string& name = param.get_name();
-        if(name == "n_cells")                              cfg.n_cells = param.as_int();
-        else if(name == "resolution")                     cfg.resolution = param.as_double();
-        else if(name == "scroll_image")                   cfg.scroll_image = param.as_int();
-        else if(name == "range_min")                      cfg.range_min = param.as_double();
-        else if(name == "range_max")                      cfg.range_max = param.as_double();
-        else if(name == "beam_width")                     cfg.beam_width = param.as_double();
-        else if(name == "n_samples")                      cfg.n_samples = param.as_int();
-        else if(name == "n_reflections")                  cfg.n_reflections = param.as_int();
-        else if(name == "beam_sample_dist")               cfg.beam_sample_dist = param.as_int();
-        else if(name == "beam_sample_dist_normal_p_in_cone") cfg.beam_sample_dist_normal_p_in_cone = param.as_double();
-        else if(name == "signal_denoising")               cfg.signal_denoising = param.as_int();
-        else if(name == "signal_denoising_triangular_width") cfg.signal_denoising_triangular_width = param.as_int();
-        else if(name == "signal_denoising_triangular_mode")  cfg.signal_denoising_triangular_mode = param.as_int();
-        else if(name == "signal_denoising_gaussian_width")   cfg.signal_denoising_gaussian_width = param.as_int();
-        else if(name == "signal_denoising_gaussian_mode")    cfg.signal_denoising_gaussian_mode = param.as_int();
-        else if(name == "signal_denoising_mb_width")         cfg.signal_denoising_mb_width = param.as_int();
-        else if(name == "signal_denoising_mb_mode")          cfg.signal_denoising_mb_mode = param.as_int();
-        else if(name == "signal_max")                     cfg.signal_max = param.as_double();
-        else if(name == "ambient_noise")                  cfg.ambient_noise = param.as_int();
-        else if(name == "ambient_noise_energy_max")       cfg.ambient_noise_energy_max = param.as_double();
-        else if(name == "ambient_noise_energy_min")       cfg.ambient_noise_energy_min = param.as_double();
-        else if(name == "ambient_noise_energy_loss")      cfg.ambient_noise_energy_loss = param.as_double();
-        else if(name == "ambient_noise_at_signal_0")      cfg.ambient_noise_at_signal_0 = param.as_double();
-        else if(name == "ambient_noise_at_signal_1")      cfg.ambient_noise_at_signal_1 = param.as_double();
-        else if(name == "ambient_noise_perlin_scale_low") cfg.ambient_noise_perlin_scale_low = param.as_double();
-        else if(name == "ambient_noise_perlin_scale_high") cfg.ambient_noise_perlin_scale_high = param.as_double();
-        else if(name == "ambient_noise_perlin_p_low")     cfg.ambient_noise_perlin_p_low = param.as_double();
-        else if(name == "record_multi_reflection")        cfg.record_multi_reflection = param.as_bool();
-        else if(name == "record_multi_path")              cfg.record_multi_path = param.as_bool();
-        else if(name == "multipath_threshold")            cfg.multipath_threshold = param.as_double();
-        else if(name == "include_motion")                 cfg.include_motion = param.as_bool();
+        if((name == "n_samples" || name == "n_reflections") && param.as_int() < 1)
+        {
+            result.successful = false;
+            result.reason = name + " must be >= 1";
+            return result;
+        }
+        if(name.rfind("det.", 0) == 0)
+        {
+            const std::string reason = radarays_gazebo_plugins::checkDetectorParam(
+                name.substr(4), param.as_double());
+            if(!reason.empty())
+            {
+                result.successful = false;
+                result.reason = reason;
+                return result;
+            }
+        }
     }
 
+    // the sensor thread reads the configuration while simulating
+    std::lock_guard<std::mutex> lock(m_cfg_mutex);
+
+    radarays_ros::RadarModelConfig cfg = m_cfg;
+    for(const auto& param : params)
+    {
+        applyParam(param, cfg);
+    }
     updateDynCfg(cfg, 0);
 
-    rcl_interfaces::msg::SetParametersResult result;
-    result.successful = true;
     return result;
 }
 
 void RadaRaysOptix::Load(const std::string& world_name)
 {
     Base::Load(world_name);
-    std::cout << "LOAD - RadaRaysOptix!" << std::endl;
+    gzdbg << "LOAD - RadaRaysOptix!" << std::endl;
 }
 
 void RadaRaysOptix::simulate(rm::Transform Tsm)
@@ -420,24 +530,20 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     // 
     if(m_polar_image.rows != m_cfg.n_cells)
     {
-        std::cout << "[RadaRaysOptix] Resize canvas to " << m_cfg.n_cells << std::endl;
+        gzdbg << "[RadaRaysOptix] Resize canvas to " << m_cfg.n_cells << std::endl;
         m_polar_image.resize(m_cfg.n_cells);
-        std::cout << "[RadaRaysOptix] Resizing canvas - done." << std::endl;
+        gzdbg << "[RadaRaysOptix] Resizing canvas - done." << std::endl;
     }
 
-    // std::cout << "Fill canvas: " << m_polar_image.cols << "x" << m_polar_image.rows << std::endl;
     m_polar_image.setTo(cv::Scalar(0));
 
     std::vector<float> denoising_weights;
     int denoising_mode = 0;
 
-    // std::cout << "[RadaRaysOptix] Sim!" << std::endl;
     if(m_cfg.signal_denoising > 0)
     {
-        // std::cout << "Signal Denoising: ";
         if(m_cfg.signal_denoising == 1)
         {
-            // std::cout << "Triangular";
             denoising_mode = m_cfg.signal_denoising_triangular_mode * m_cfg.signal_denoising_triangular_width;
             denoising_weights = make_denoiser_triangular(
                 m_cfg.signal_denoising_triangular_width,
@@ -445,7 +551,6 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             );
             
         } else if(m_cfg.signal_denoising == 2) {
-            // std::cout << "Gaussian";
             denoising_mode = m_cfg.signal_denoising_gaussian_mode * m_cfg.signal_denoising_gaussian_width;
             denoising_weights = make_denoiser_gaussian(
                 m_cfg.signal_denoising_gaussian_width,
@@ -453,17 +558,14 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             );
 
         } else if(m_cfg.signal_denoising == 3) {
-            // std::cout << "Maxwell Boltzmann";
             denoising_mode = m_cfg.signal_denoising_mb_mode * m_cfg.signal_denoising_mb_width;
             denoising_weights = make_denoiser_maxwell_boltzmann(
                 m_cfg.signal_denoising_mb_width,
                 denoising_mode
             );
         }
-        // std::cout << std::endl;
 
         // scale so that mode has weight 1
-        // if(false)
         if(denoising_weights.size() > 0)
         {
             double denoising_mode_val = denoising_weights[denoising_mode];
@@ -489,7 +591,6 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     }
 
 
-    // el = sw();
     DirectedWaveAttributes wave_att_ex;
     wave_att_ex.energy       =  1.0;
     wave_att_ex.polarization =  0.5;
@@ -498,12 +599,14 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     wave_att_ex.material_id  =  0;   // air
     wave_att_ex.time         =  0.0; // ns
 
-    int n_cells = m_polar_image.rows;
-    int n_angles = m_polar_image.cols;
+    const size_t n_cells = static_cast<size_t>(m_polar_image.rows);
+    const size_t n_angles = static_cast<size_t>(m_polar_image.cols);
+    // number of reflection passes, 0 when disabled
+    const size_t n_passes = static_cast<size_t>(std::max(m_cfg.n_reflections, 0));
 
     // prepare radar model
 
-    int n_phi = m_radar_model.phi.size;
+    const size_t n_phi = m_radar_model.phi.size;
     size_t n_rays = n_angles * n_phi * m_cfg.n_samples;
 
     rm::OnDnModel waves;
@@ -515,13 +618,18 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
     rm::Memory<DirectedWaveAttributes> wave_attributes(n_rays);
 
     rm::Vector front = {1.0, 0.0, 0.0};
-    rm::Memory<rm::Vector> ray_dirs_local = sample_cone(
-        front,
-        m_params.model.beam_width,
-        m_params.model.n_samples,
-        m_cfg.beam_sample_dist,
-        m_cfg.beam_sample_dist_normal_p_in_cone
-    );
+    if(m_resample || m_resample_every_frame)
+    {
+        m_ray_dirs_local_cache = sample_cone(
+            front,
+            m_params.model.beam_width,
+            m_params.model.n_samples,
+            m_cfg.beam_sample_dist,
+            m_cfg.beam_sample_dist_normal_p_in_cone
+        );
+        m_resample = false;
+    }
+    rm::Memory<rm::Vector>& ray_dirs_local = m_ray_dirs_local_cache;
 
     for(size_t angle_id=0; angle_id<n_angles; angle_id++)
     {
@@ -538,32 +646,23 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             {
                 size_t buf_id = sample_id * waves.width + col_id;
                 waves.dirs[buf_id] = Tas.R * ray_dirs_local[sample_id];
-                waves.origs[buf_id] = {0.0, 0.0, 0.0};
+                // start outside of the own vehicle, the skipped distance still counts
+                waves.origs[buf_id] = waves.dirs[buf_id] * m_self_clearance;
                 wave_attributes[buf_id] = wave_att_ex;
+                wave_attributes[buf_id].time = m_self_clearance / wave_att_ex.velocity;
             }
         }
     }
 
-    // std::cout << "Done filling model" << std::endl;
 
-    // going to GPU
-    // 1. preallocate everything necessary
-
-    // m_sim->preBuildProgram<ResT>();
-    // std::cout << "Prealloc memory buffers - start" << std::endl;
-
-    // pass 1
-    if(m_waves_gpu.size() != m_cfg.n_reflections)
+    // GPU ray buffers, rebuilt whenever the number of rays changed
+    if(m_work_memory_dirty || m_waves_gpu.size() != n_passes)
     {
-        std::cout << "Prealloc memory buffers - start" << std::endl;
         initWorkMemory();
-        std::cout << "Prealloc memory buffers - end" << std::endl;
+        m_work_memory_dirty = false;
     }
 
 
-   
-    
-    // rm::Transform Tsm = Tsm_last;
     rm::Memory<rm::Transform, rm::VRAM_CUDA> Tsms_;
     { // upload
         rm::Memory<rm::Transform> Tsms(1);
@@ -571,21 +670,9 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
         Tsms_ = Tsms;
     }
 
-    // std::cout << "Start Simulation from pose: " << Tsm << std::endl;
-
-    // m_sim->setModel(m_waves_gpu[0]);
-
-    rm::StopWatch sw;
-    double el_tot = 0.0;
-    double el1;
-    double el2;
-    double el3;
 
     // 1. Generate Signals
-    // sw();
     {
-        // std::cout << "[RadaRaysOptix] start simulate" << std::endl;
-        // sw();
 
         if(m_cfg.n_reflections > 0)
         {
@@ -595,7 +682,7 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
 
             if(wave_attributes.size() != m_wave_attributes_gpu[0].size())
             {
-                std::cout << "PREALLOCATED MEMORY WRONG!" << std::endl;
+                gzdbg << "PREALLOCATED MEMORY WRONG!" << std::endl;
                 return;
             }
             m_wave_attributes_gpu[0] = wave_attributes;
@@ -606,48 +693,28 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
             // - sim
             // - reflection shader
             // - if 
-            for(size_t i=0; i<m_cfg.n_reflections; i++)
+            for(size_t i=0; i<n_passes; i++)
             {
                 m_sim->setModel(m_waves_gpu[i]);
-                // std::cout << "[RadaRaysOptix] Simulate Signals - pass " << i+1 << std::endl;
                 
-                // if(m_map_mutex)
-                // {
-                //     std::cout << "RADARAYS: Lock Map" << std::endl;
-                //     m_map_mutex->lock_shared();
-                // }
                 
                 m_sim->simulate(Tsms_, m_results[i]);
 
-                // if(m_map_mutex)
-                // {
-                //     std::cout << "RADARAYS: Unlock Map" << std::endl;
-                //     m_map_mutex->unlock_shared();
-                // }
 
-                // cudaDeviceSynchronize();
-                // el = sw(); el_tot += el;
-                // std::cout << "- ray cast: " << el*1000.0 << "ms" << std::endl;
-                // std::cout << "[RadaRaysOptix] end simulate" << std::endl;
-
-                // sw();
                 move_waves(
                     m_waves_gpu[i].origs,
                     m_waves_gpu[i].dirs,
                     m_wave_attributes_gpu[i],
                     m_results[i].ranges, 
                     m_results[i].hits);
-                // el = sw(); el_tot += el;
 
-                // std::cout << "- move: " << el*1000.0 << "ms" << std::endl;
                 if(m_materials_gpu.size() == 0 || m_object_materials.size() == 0)
                 {
-                    std::cout << "[RadaRaysOptix] WARNING. materials or object->materials buffers seam to have wrong sizes" << std::endl;
-                    std::cout << "- Materials: " << m_materials_gpu.size() << std::endl;
-                    std::cout << "- Objects with materials: " << m_object_materials.size() << std::endl;
+                    gzdbg << "[RadaRaysOptix] WARNING. materials or object->materials buffers seam to have wrong sizes" << std::endl;
+                    gzdbg << "- Materials: " << m_materials_gpu.size() << std::endl;
+                    gzdbg << "- Objects with materials: " << m_object_materials.size() << std::endl;
                 }
                
-                // sw();
                 signal_shader(
                     m_materials_gpu,
                     m_object_materials_gpu,
@@ -662,10 +729,8 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                     m_signals[i]
                 );
 
-                // sw();
-                if(i < m_cfg.n_reflections - 1)
+                if(i + 1 < n_passes)
                 {
-                    // std::cout << i+1 << " -> SPLIT -> " << i+2 << std::endl;
                     // i -> i+1
                     auto lo = m_waves_gpu[i+1].origs(0, m_waves_gpu[i].origs.size());
                     auto ld = m_waves_gpu[i+1].dirs(0, m_waves_gpu[i].dirs.size());
@@ -691,142 +756,259 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
                         lo, ld, la,
                         ro, rd, ra
                     );
-                    // cudaDeviceSynchronize();
                 } // fresnel split
             }
         }  
     }
-    // el1 = sw(); el_tot += el1;
     
-    // std::cout << "RUNTIME" << std::endl;
-    // std::cout << "- Signal Gen: " << el1 << "s" << std::endl;
 
+    // Generate GT points from first pass ray casting hits (before signal processing)
+    m_radar_points_gt.clear();
+    if(m_gt_requested && m_cfg.n_reflections > 0)
+    {
+        rm::Memory<uint8_t> hits_gt = m_results[0].hits;
+        rm::Memory<float> ranges_gt = m_results[0].ranges;
+        cudaDeviceSynchronize();
 
-    // USE UNIFIED MEMORY
-    rm::Memory<float, rm::UNIFIED_CUDA> img(n_cells * n_angles);
-    rm::Memory<float, rm::UNIFIED_CUDA> max_vals(n_angles);
-    rm::Memory<unsigned int, rm::UNIFIED_CUDA> signal_counts(n_angles);
-    rm::Memory<float, rm::UNIFIED_CUDA> random_begins(n_angles);
+        size_t wave_width_gt = n_angles * n_phi;
+        for(size_t angle_id = 0; angle_id < n_angles; angle_id++)
+        {
+            for(size_t phi_id = 0; phi_id < n_phi; phi_id++)
+            {
+                size_t col_id = angle_id * n_phi + phi_id;
+                // Use first sample only for GT (sample_id=0)
+                size_t hit_id = 0 * wave_width_gt + col_id;
+                if(hit_id < hits_gt.size() && hits_gt[hit_id])
+                {
+                    float range = ranges_gt[hit_id] + m_self_clearance;
+                    if(range >= m_radar_model.range.min && range <= m_radar_model.range.max)
+                    {
+                        float theta = m_radar_model.getTheta(angle_id);
+                        float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
 
-    cudaMemset(img.raw(), 0, n_cells * n_angles * sizeof(float) );
-    cudaMemset(max_vals.raw(), 0, n_angles * sizeof(float) );
-    cudaMemset(signal_counts.raw(), 0, n_angles * sizeof(unsigned int) );
+                        radarays_gazebo_plugins::RadarPoint pt;
+                        pt.x = range * cos(phi_angle) * cos(theta);
+                        pt.y = range * cos(phi_angle) * sin(theta);
+                        pt.z = -range * sin(phi_angle);
+                        pt.intensity = 1.0;
+                        pt.velocity = 0.0f;
+                        m_radar_points_gt.push_back(pt);
+                    }
+                }
+            }
+        }
+    }
 
-    std::vector<rm::Memory<Signal> > signals_cpu(m_cfg.n_reflections);
-    std::vector<rm::Memory<uint8_t> > hits_cpu(m_cfg.n_reflections);
+    // download the signals of all passes
+    std::vector<rm::Memory<Signal> > signals_cpu(n_passes);
+    std::vector<rm::Memory<uint8_t> > hits_cpu(n_passes);
 
-    for(size_t i=0; i<m_cfg.n_reflections; i++)
+    for(size_t i=0; i<n_passes; i++)
     {
         signals_cpu[i] = m_signals[i];
         hits_cpu[i] = m_results[i].hits;
     }
 
+    // velocity of moving map objects in the sensor frame. Only the directly
+    // hit object (first pass) is considered, multipath keeps the static Doppler.
+    std::vector<rm::Vector> object_velocity(m_object_links.size(), rm::Vector{0.0f, 0.0f, 0.0f});
+    std::vector<uint8_t> object_moves(m_object_links.size(), 0);
+    bool any_moving = false;
+    for(size_t i = 0; i < m_object_links.size(); i++)
+    {
+        if(m_object_links[i])
+        {
+            const auto v = m_object_links[i]->WorldLinearVel();
+            if(v.SquaredLength() > 1e-6)
+            {
+                object_velocity[i] = Tsm.R.inv() * rm::Vector{(float)v.X(), (float)v.Y(), (float)v.Z()};
+                object_moves[i] = 1;
+                any_moving = true;
+            }
+        }
+    }
+    rm::Memory<unsigned int> object_ids_cpu;
+    if(any_moving && m_cfg.n_reflections > 0)
+    {
+        object_ids_cpu = m_results[0].object_ids;
+    }
+
     cudaDeviceSynchronize();
 
-    // Collect radar points for PointCloud2
-    m_radar_points.clear();
+    // the polar image is only built when somebody listens to it
+    const bool make_image = m_image_requested;
+
+    rm::Memory<float, rm::UNIFIED_CUDA> img;
+    rm::Memory<float, rm::UNIFIED_CUDA> max_vals;
+    rm::Memory<float, rm::UNIFIED_CUDA> random_begins;
+    if(make_image)
+    {
+        img.resize(n_cells * n_angles);
+        max_vals.resize(n_angles);
+        random_begins.resize(n_angles);
+        cudaMemset(img.raw(), 0, n_cells * n_angles * sizeof(float) );
+        cudaMemset(max_vals.raw(), 0, n_angles * sizeof(float) );
+    }
 
     // width of the wave model is n_angles * n_phi
-    size_t wave_width = n_angles * n_phi;
+    const size_t wave_width = n_angles * n_phi;
+    const size_t n_samples = m_cfg.n_samples;
 
-    // 2. noise(signal+system) signals
-    // sw();
+    // solid angle one beam stands for (before splitting into samples)
+    const float d_theta = fabs(m_radar_model.theta.inc);
+    const float d_phi = (n_phi > 1) ? fabs(m_radar_model.phi.inc) : d_theta;
+
+    // 2. collect the returns of every ray
+    // Single threaded on purpose: these are a few thousand signals, and a
+    // parallel region here keeps all cores of the host busy at sensor rate.
+    m_returns.clear();
+
+    for(size_t angle_id_ = 0; angle_id_ < n_angles; angle_id_++)
     {
-        size_t n_samples = m_cfg.n_samples;
+        const size_t angle_id = (m_cfg.scroll_image + angle_id_) % n_angles;
+        const unsigned int img_offset = angle_id * n_cells;
+        const float theta = m_radar_model.getTheta(angle_id);
+        const float cos_theta = cos(theta);
+        const float sin_theta = sin(theta);
 
-        #pragma omp parallel for
-        for(size_t angle_id_ = 0; angle_id_ < n_angles; angle_id_++)
+        float max_val = 0.0;
+
+        for(size_t phi_id=0; phi_id<n_phi; phi_id++)
         {
-            size_t angle_id = (m_cfg.scroll_image + angle_id_) % n_angles;
+            const size_t col_id = angle_id * n_phi + phi_id;
+            const float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
+            const float cos_phi = cos(phi_angle);
+            const float sin_phi = sin(phi_angle);
 
-            unsigned int img_offset = angle_id * n_cells;
+            // beam direction in the sensor frame (positive phi pitches down)
+            const float ux = cos_phi * cos_theta;
+            const float uy = cos_phi * sin_theta;
+            const float uz = -sin_phi;
 
-            float max_val = 0.0;
-            unsigned int signal_count = 0;
+            // Doppler: radial velocity of a static world seen from the moving sensor
+            const float radial_velocity = -(m_sensor_velocity.x * ux
+                + m_sensor_velocity.y * uy + m_sensor_velocity.z * uz);
+            const float solid_angle = d_theta * d_phi * fabs(cos_phi) / static_cast<float>(n_samples);
 
-            for(size_t pass_id=0; pass_id < m_cfg.n_reflections; pass_id++)
+            for(size_t pass_id=0; pass_id < n_passes; pass_id++)
             {
-                int size_factor = std::pow(2, pass_id);
-                for(size_t phi_id=0; phi_id<n_phi; phi_id++)
+                if(pass_id > 0 && !m_cfg.record_multi_reflection)
                 {
-                    size_t col_id = angle_id * n_phi + phi_id;
+                    break;
+                }
 
-                    for(size_t sample_id=0; sample_id < n_samples * size_factor; sample_id++)
+                const size_t size_factor = static_cast<size_t>(1) << pass_id;
+
+                for(size_t sample_id=0; sample_id < n_samples * size_factor; sample_id++)
+                {
+                    const size_t signal_id = sample_id * wave_width + col_id;
+
+                    if(signal_id >= hits_cpu[pass_id].size() || !hits_cpu[pass_id][signal_id])
                     {
-                        const unsigned int signal_id = sample_id * wave_width + col_id;
+                        continue;
+                    }
 
-                        if(signal_id >= hits_cpu[pass_id].size())
-                            continue;
+                    const Signal signal = signals_cpu[pass_id][signal_id];
+                    // the wave travels 0.3 m/ns, there and back
+                    const float signal_dist = 0.3 * signal.time / 2.0;
+                    const float strength = signal.strength;
 
-                        if(hits_cpu[pass_id][signal_id])
+                    if(!std::isfinite(signal_dist) || !std::isfinite(strength))
+                    {
+                        continue;
+                    }
+
+                    if(make_image)
+                    {
+                        const int cell = static_cast<int>(signal_dist / m_cfg.resolution);
+                        if(cell >= 0 && static_cast<size_t>(cell) < n_cells)
                         {
-                            auto signal = signals_cpu[pass_id][signal_id];
-                            float half_time = signal.time / 2.0;
-                            float signal_dist = 0.3 * half_time;
-
-                            int cell = static_cast<int>(signal_dist / m_cfg.resolution);
-                            if(cell < n_cells)
+                            if(m_cfg.signal_denoising > 0)
                             {
-                                if(m_cfg.signal_denoising > 0)
+                                for(int vid = 0; vid < static_cast<int>(denoising_weights.size()); vid++)
                                 {
-                                    for(int vid = 0; vid < denoising_weights.size(); vid++)
+                                    const int glob_id = vid + cell - denoising_mode;
+                                    if(glob_id > 0 && static_cast<size_t>(glob_id) < n_cells)
                                     {
-                                        int glob_id = vid + cell - denoising_mode;
-                                        if(glob_id > 0 && glob_id < n_cells)
-                                        {
-                                            const float old_val = img[img_offset + glob_id];
-                                            const float new_val = old_val + signal.strength * denoising_weights[vid];
-                                            img[img_offset + glob_id] = new_val;
-
-                                            if(new_val > max_val)
-                                            {
-                                                max_val = new_val;
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    const float old_val = img[img_offset + cell];
-                                    const float new_val = std::max(old_val, (float)signal.strength);
-                                    img[img_offset + cell] = new_val;
-
-                                    if(new_val > max_val)
-                                    {
-                                        max_val = new_val;
+                                        const float new_val = img[img_offset + glob_id]
+                                            + strength * denoising_weights[vid];
+                                        img[img_offset + glob_id] = new_val;
+                                        max_val = std::max(max_val, new_val);
                                     }
                                 }
-
-                                signal_count++;
-
-                                // Generate 3D point for PointCloud2
-                                if(signal_dist >= m_radar_model.range.min
-                                   && signal_dist <= m_radar_model.range.max
-                                   && signal.strength > m_wave_energy_threshold)
-                                {
-                                    float theta = m_radar_model.getTheta(angle_id);
-                                    float phi_angle = m_radar_model.phi.min + phi_id * m_radar_model.phi.inc;
-                                    float cos_phi = cos(phi_angle);
-                                    float sin_phi = sin(phi_angle);
-                                    float cos_theta = cos(theta);
-                                    float sin_theta = sin(theta);
-
-                                    radarays_gazebo_plugins::RadarPoint pt;
-                                    pt.x = signal_dist * cos_phi * cos_theta;
-                                    pt.y = signal_dist * cos_phi * sin_theta;
-                                    pt.z = -signal_dist * sin_phi;
-                                    pt.intensity = static_cast<float>(signal.strength);
-                                    #pragma omp critical
-                                    m_radar_points.push_back(pt);
-                                }
+                            } else {
+                                const float new_val = std::max(img[img_offset + cell], strength);
+                                img[img_offset + cell] = new_val;
+                                max_val = std::max(max_val, new_val);
                             }
                         }
                     }
+
+                    if(signal_dist >= m_radar_model.range.min
+                        && signal_dist <= m_radar_model.range.max
+                        && strength > m_wave_energy_threshold)
+                    {
+                        radarays_gazebo_plugins::RadarReturn ret;
+                        ret.range = signal_dist;
+                        ret.dx = ux;
+                        ret.dy = uy;
+                        ret.dz = uz;
+                        ret.power = strength;
+                        ret.radial_velocity = radial_velocity;
+                        if(any_moving && pass_id == 0 && signal_id < object_ids_cpu.size())
+                        {
+                            const unsigned int obj = object_ids_cpu[signal_id];
+                            if(obj < object_moves.size() && object_moves[obj])
+                            {
+                                // range rate = (v_object - v_sensor) . beam direction
+                                ret.radial_velocity += object_velocity[obj].x * ux
+                                    + object_velocity[obj].y * uy + object_velocity[obj].z * uz;
+                            }
+                        }
+                        ret.solid_angle = solid_angle;
+                        m_returns.push_back(ret);
+                    }
                 }
             }
-
-            max_vals[angle_id] = max_val;
-            signal_counts[angle_id] = signal_count;
         }
 
+        if(make_image)
+        {
+            max_vals[angle_id] = max_val;
+        }
+    }
+
+    // 3. detection: sparse point cloud like the real device
+    if(m_detector.params.enabled > 0.5)
+    {
+        radarays_gazebo_plugins::RadarSensorPose sensor_pose;
+        sensor_pose.x = Tsm.t.x;
+        sensor_pose.y = Tsm.t.y;
+        sensor_pose.z = Tsm.t.z;
+        sensor_pose.qx = Tsm.R.x;
+        sensor_pose.qy = Tsm.R.y;
+        sensor_pose.qz = Tsm.R.z;
+        sensor_pose.qw = Tsm.R.w;
+        m_radar_points = m_detector.process(m_returns, sensor_pose);
+    } else {
+        // raw ray hits, for debugging the ray tracing
+        m_radar_points.clear();
+        m_radar_points.reserve(m_returns.size());
+        for(const auto& ret : m_returns)
+        {
+            radarays_gazebo_plugins::RadarPoint pt;
+            pt.x = ret.range * ret.dx;
+            pt.y = ret.range * ret.dy;
+            pt.z = ret.range * ret.dz;
+            pt.intensity = ret.power;
+            pt.velocity = ret.radial_velocity;
+            m_radar_points.push_back(pt);
+        }
+    }
+
+    // 4. polar image
+    if(make_image)
+    {
         if(m_cfg.ambient_noise)
         {
             std::random_device                      rand_dev;
@@ -866,21 +1048,22 @@ void RadaRaysOptix::simulate(rm::Transform Tsm)
         }
 
         float max_signal = m_cfg.signal_max;
-        cv::Mat_<float> polar_img_f(n_cells, n_angles);
+        cv::Mat_<float> polar_img_f(static_cast<int>(n_cells), static_cast<int>(n_angles));
 
         for(size_t x=0; x<n_angles; x++)
         {
-            float max_val = max_vals[x];
+            // columns without any return stay black instead of dividing by zero
+            const float max_val = max_vals[x];
+            const float scale = (max_val > 0.0f) ? max_signal / max_val : 0.0f;
 
             for(size_t y=0; y<n_cells; y++)
             {
-                polar_img_f.at<float>(y, x) = img[x * n_cells + y] * max_signal / max_val;
+                polar_img_f.at<float>(y, x) = img[x * n_cells + y] * scale;
             }
         }
         polar_img_f.convertTo(m_polar_image, CV_8UC1);
     }
     
-    // std::cout << std::fixed << std::setprecision(8) << el1/el_tot << ", " << el2/el_tot << ", " << el3/el_tot << ", " << el_tot << std::endl;
 }
 
 bool RadaRaysOptix::UpdateImpl(const bool _force)
@@ -901,46 +1084,53 @@ bool RadaRaysOptix::UpdateImpl(const bool _force)
 
         if(!m_sim)
         {
-            // m_map->context()->getCudaContext()->use();
             m_sim = std::make_shared<rm::OnDnSimulatorOptix>(m_map);
-            std::cout << "[RadaRaysOptix] OnDnSimulator constructed." << std::endl;
+            gzdbg << "[RadaRaysOptix] OnDnSimulator constructed." << std::endl;
             
-            // m_sim->setMap(m_map);
             m_sim->setTsb(rm::Transform::Identity());
-            std::cout << "[RadaRaysOptix] OnDnSimulator map set." << std::endl;
+            gzdbg << "[RadaRaysOptix] OnDnSimulator map set." << std::endl;
             
             m_sim->preBuildProgram<ResT>();
         }
 
-        if(!m_materials_searched)
-        {
-            std::cout << "Search for radarays materials!!" << std::endl;
-            searchForMaterials();
-            m_materials_searched = true;
-
-            // Force reinit work memory after materials are loaded
-            // to ensure GPU buffers match the phi-extended ray count
-            std::cout << "[RadaRaysOptix] Force reinit work memory" << std::endl;
-            initWorkMemory();
-        }
     }
 
-    // std::cout << "RADARAYS UPDATE" << std::endl;
     auto pose = this->parentEntity->WorldPose();
+    auto linear_vel = this->parentEntity->WorldLinearVel();
+
     rm::Transform Tbm = to_rm(pose);
 
     rm::Transform Tsm = Tbm * m_Tsb;
 
-    // std::cout << "World Pose of sensor: " << Tsm << std::endl;
+    // Doppler needs the sensor velocity expressed in the sensor frame
+    const rm::Vector vel_world = {(float)linear_vel.X(), (float)linear_vel.Y(), (float)linear_vel.Z()};
+    const rm::Vector vel_sensor = Tsm.R.inv() * vel_world;
+    m_sensor_velocity = {vel_sensor.x, vel_sensor.y, vel_sensor.z};
+
     if(m_map_mutex)
     {
         m_map_mutex->lock_shared();
     }
 
-    // m_map->context()->getCudaContext()->use();
+    {
+        // parameters may change from the ROS thread
+        std::lock_guard<std::mutex> cfg_lock(m_cfg_mutex);
 
-    // fill global simulation buffer
-    simulate(Tsm);
+        // models can be spawned or removed at any time: keep the
+        // object -> material table in sync with the map
+        const auto geoms = m_map->scene()->geometries();
+        const size_t geom_signature = geoms.size() * 100003
+            + (geoms.empty() ? 0 : geoms.rbegin()->first);
+        if(!m_materials_searched || geom_signature != m_geom_signature)
+        {
+            searchForMaterials();
+            m_materials_searched = true;
+            m_geom_signature = geom_signature;
+        }
+
+        // fill global simulation buffer
+        simulate(Tsm);
+    }
 
     if(m_map_mutex)
     {
@@ -952,10 +1142,10 @@ bool RadaRaysOptix::UpdateImpl(const bool _force)
 
 void RadaRaysOptix::initWorkMemory()
 {
-    std::cout << "Resizing working memory for " << m_cfg.n_reflections << " reflections passes" << std::endl;
+    gzdbg << "Resizing working memory for " << m_cfg.n_reflections << " reflections passes" << std::endl;
     if(m_cfg.n_reflections == 0)
     {
-        std::cout << "Cannot init working memory for 0 reflections!" << std::endl;
+        gzdbg << "Cannot init working memory for 0 reflections!" << std::endl;
         return;
     }
     // update preallocated memory buffers
@@ -965,14 +1155,14 @@ void RadaRaysOptix::initWorkMemory()
     m_signals.resize(m_cfg.n_reflections);
     m_signal_mask.resize(m_cfg.n_reflections);
 
-    int n_cells = m_cfg.n_cells;
-    int n_angles = m_radar_model.theta.size;
-    int n_phi = m_radar_model.phi.size;
+    const size_t n_passes = static_cast<size_t>(m_cfg.n_reflections);
+    const size_t n_angles = m_radar_model.theta.size;
+    const size_t n_phi = m_radar_model.phi.size;
     size_t n_rays = n_angles * n_phi * m_cfg.n_samples;
 
     if(m_cfg.n_reflections > 0)
     {
-        std::cout << "Alloc for Pass 1" << std::endl;
+        gzdbg << "Alloc for Pass 1" << std::endl;
         // pass - i = 0
         {
             m_waves_gpu[0].width = n_angles * n_phi;
@@ -990,9 +1180,9 @@ void RadaRaysOptix::initWorkMemory()
         m_signal_mask[0].resize(m_waves_gpu[0].size());
 
         // pass - i > 0
-        for(size_t i=1; i<m_cfg.n_reflections; i++)
+        for(size_t i=1; i<n_passes; i++)
         {
-            std::cout << "Alloc for Pass " << i+1 << std::endl;
+            gzdbg << "Alloc for Pass " << i+1 << std::endl;
             // pass i
 
             // m_waves_gpu
@@ -1021,11 +1211,6 @@ void RadaRaysOptix::updateDynCfg(
 {
     RCLCPP_INFO(m_nh_p->get_logger(), "RadaRaysOptix - Changing Model");
     
-    // z_offset
-    // auto T = rm::Transform::Identity();
-    // T.t.z = config.z_offset;
-    // sim->setTsb(T);
-
     if(   config.beam_sample_dist != m_cfg.beam_sample_dist 
         || abs(config.beam_width - m_cfg.beam_width ) > 0.001
         || config.n_samples != m_cfg.n_samples
@@ -1040,20 +1225,18 @@ void RadaRaysOptix::updateDynCfg(
     m_radar_model.range.max = config.range_max;
 
     // update params model
+    // ray buffers depend on both values: rebuild them in the sensor thread
+    if(config.n_reflections != static_cast<int>(m_params.model.n_reflections)
+        || config.n_samples != static_cast<int>(m_params.model.n_samples))
+    {
+        m_work_memory_dirty = true;
+    }
+
     m_params.model.beam_width = config.beam_width * M_PI / 180.0;
     m_params.model.n_samples = config.n_samples;
-    
-    bool buffer_reinit = (config.n_reflections != m_params.model.n_reflections);
-    
     m_params.model.n_reflections = config.n_reflections;
 
     m_cfg = config;
-
-    if(buffer_reinit)
-    {
-        std::cout << "REINIT PREALLOCATED MEMORY BUFFER FOR " << m_params.model.n_reflections << " REFLECTIONS" << std::endl;
-        initWorkMemory();
-    }
 }
 
 

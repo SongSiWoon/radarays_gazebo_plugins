@@ -208,6 +208,13 @@ install(DIRECTORY launch worlds urdf
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  # the detection stage is header only: tested without Gazebo or a GPU
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_radar_detector test/test_radar_detector.cpp)
+  target_include_directories(test_radar_detector PRIVATE include)
+endif()
+
 ament_environment_hooks("${CMAKE_CURRENT_SOURCE_DIR}/hooks/${PROJECT_NAME}.dsv.in")
 ament_environment_hooks("${CMAKE_CURRENT_SOURCE_DIR}/hooks/${PROJECT_NAME}.sh.in")
 

@@ -34,6 +34,8 @@
 #include <radarays_ros/radar_types.h>
 
 #include <radarays_gazebo_plugins/radar_point.h>
+#include <radarays_gazebo_plugins/radar_detector.h>
+#include <mutex>
 
 namespace rm = rmagine;
 
@@ -59,9 +61,19 @@ public:
     // 3D radar points for PointCloud2 output
     std::vector<radarays_gazebo_plugins::RadarPoint> m_radar_points;
 
+    // Ground truth points from direct ray casting hits
+    std::vector<radarays_gazebo_plugins::RadarPoint> m_radar_points_gt;
+
+    // Set by the ROS plugin: build the polar image only if somebody listens
+    bool m_image_requested = true;
+
+    // detection stage, public for the ROS plugin: heat map requests and results
+    radarays_gazebo_plugins::RadarDetector& detector() { return m_detector; }
+
 protected:
     virtual bool UpdateImpl(const bool _force) override;
 
+    void loadDetectorSDF();
     void loadParamsSDF();
     void loadParams();
 
@@ -81,7 +93,8 @@ protected:
     // Parameter callback handle
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr m_param_callback;
 
-    std::unordered_map<unsigned int, rm::OnDnSimulatorEmbreePtr> m_sims;
+    // one ray tracer, all beams of a pass go through it in a single call
+    rm::OnDnSimulatorEmbreePtr m_sim;
 
      // Params
     radarays_ros::msg::RadarParams m_params;
@@ -96,6 +109,29 @@ protected:
     float m_wave_energy_threshold = 0.001;
     std::vector<radarays_ros::DirectedWave> m_waves_start;
     bool m_resample = true;
+    bool m_resample_every_frame = false;
+
+    // guards the configuration: ROS thread writes, sensor thread reads
+    std::mutex m_cfg_mutex;
+
+    // FMCW detection stage (rays -> sparse detections)
+    radarays_gazebo_plugins::RadarDetector m_detector;
+    std::vector<radarays_gazebo_plugins::RadarReturn> m_returns;
+
+    // <ray_tracing> from the sensor SDF: beam width [deg], rays per beam, bounces
+    double m_sdf_beam_width = 1.5;
+    int m_sdf_n_samples = 2;
+    int m_sdf_n_reflections = 2;
+
+    // <ray_tracing><self_clearance> [m]: rays start this far from the sensor,
+    // so the vehicle carrying the radar does not block its own view
+    float m_self_clearance = 0.0;
+
+    // material of map objects without <radarays_material>
+    radarays_ros::msg::RadarMaterial m_default_material;
+
+    // Sensor velocity in the sensor frame, for Doppler calculation
+    struct { float x; float y; float z; } m_sensor_velocity = {0, 0, 0};
     float m_max_signal = 120.0;
 };
 
